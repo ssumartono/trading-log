@@ -11,14 +11,21 @@ DB.parent.mkdir(exist_ok=True)
 LOCK = threading.RLock()
 WIB = timezone(timedelta(hours=7))
 
+class DatabaseConnection(sqlite3.Connection):
+    def __exit__(self,*args):
+        try:return super().__exit__(*args)
+        finally:self.close()
+
 def connect():
-    db = sqlite3.connect(DB)
+    db = sqlite3.connect(DB,timeout=30,factory=DatabaseConnection)
     db.execute('PRAGMA journal_mode=WAL')
     db.execute('CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS mt5_deals (server TEXT, login INTEGER, ticket INTEGER, data TEXT NOT NULL, PRIMARY KEY(server,login,ticket))')
     db.execute('CREATE TABLE IF NOT EXISTS sync_runs (id INTEGER PRIMARY KEY, time TEXT, result TEXT)')
     db.execute('CREATE TABLE IF NOT EXISTS daily_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1)')
     db.execute('CREATE TABLE IF NOT EXISTS trader_messages (id INTEGER PRIMARY KEY AUTOINCREMENT,broker_id TEXT,role TEXT,content TEXT,created_at TEXT,context TEXT)')
+    from user_auth import schema
+    schema(db)
     return db
 
 def load(db):
@@ -270,10 +277,71 @@ def write_note(db,data):
     return dict(note,id=cursor.lastrowid,revision=1)
 
 class Handler(BaseHTTPRequestHandler):
-    def reply(self, status, data):
+    def reply(self, status, data,session_cookie=None):
         body=json.dumps(data).encode()
-        self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(body)
+        self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store')
+        if session_cookie:self.send_header('Set-Cookie',session_cookie)
+        self.end_headers();self.wfile.write(body)
+    def auth_gate(self,method):
+        from user_auth import current_user,endpoint_permission,require
+        with LOCK,connect() as db:self.user=current_user(db,self.headers.get('Cookie'))
+        permission=endpoint_permission(self.path,method)
+        try:
+            if not self.user:raise PermissionError('Silakan login terlebih dahulu.')
+            if permission:require(self.user,permission)
+            if permission=='ai.use':require(self.user,'data.view')
+            return True
+        except PermissionError as e:
+            self.reply(401 if not self.user else 403,{'error':str(e)});return False
+    def auth_post(self):
+        from user_auth import create_user,login,session,cookie,current_user,update_user,require,save_role,token_from_cookie
+        length=int(self.headers.get('Content-Length','0'))
+        if length>20000:raise ValueError('Input terlalu besar.')
+        data=json.loads(self.rfile.read(length));status=200;session_cookie=None
+        with LOCK,connect() as db:
+            user=current_user(db,self.headers.get('Cookie'))
+            if self.path=='/api/auth/setup':
+                user=create_user(db,data,first=True);session_cookie=cookie(session(db,user['id']));result={'user':user}
+            elif self.path=='/api/auth/login':
+                user=login(db,data)
+                if user:session_cookie=cookie(session(db,user['id']));result={'user':user}
+                else:status=401;result={'error':'Username atau password salah.'}
+            elif self.path=='/api/auth/logout':
+                import hashlib
+                token=token_from_cookie(self.headers.get('Cookie'));db.execute('DELETE FROM app_sessions WHERE token_hash=?',(hashlib.sha256(token.encode()).hexdigest(),));session_cookie=cookie('');result={'loggedOut':True}
+            elif self.path=='/api/auth/profile':
+                if not user:raise PermissionError('Silakan login terlebih dahulu.')
+                result={'user':update_user(db,user,data,profile=True),'passwordChanged':bool(data.get('password'))}
+                if data.get('password'):session_cookie=cookie(session(db,user['id']))
+            elif self.path=='/api/admin/users':
+                require(user,'users.manage')
+                if user['role']!='Administrator':
+                    from user_auth import public_user
+                    target=public_user(db,int(data['id'])) if data.get('id') else None
+                    role=data.get('role',target['role'] if target else 'Viewer')
+                    rights=db.execute('SELECT permissions FROM app_roles WHERE name=?',(role,)).fetchone()
+                    if (target and target['role']=='Administrator') or role=='Administrator' or (rights and not set(json.loads(rights[0])).issubset(user['permissions'])):
+                        raise PermissionError('Tidak boleh memberikan atau mengubah akses yang melebihi hak akses Anda.')
+                result={'user':update_user(db,user,data) if data.get('id') else create_user(db,data)}
+            elif self.path=='/api/admin/roles':
+                require(user,'roles.manage')
+                if user['role']!='Administrator' and not set(data.get('permissions',[])).issubset(user['permissions']):raise PermissionError('Tidak boleh memberikan hak akses yang tidak Anda miliki.')
+                save_role(db,data);result={'saved':True}
+            else:raise ValueError('Endpoint tidak ditemukan.')
+        self.reply(status,result,session_cookie)
     def do_GET(self):
+        if self.path=='/api/auth/status':
+            from user_auth import current_user
+            with LOCK,connect() as db:result={'setupRequired':not db.execute('SELECT 1 FROM app_users LIMIT 1').fetchone(),'user':current_user(db,self.headers.get('Cookie'))}
+            return self.reply(200,result)
+        if self.path.startswith('/api/') and not self.auth_gate('GET'):return
+        if self.path in ('/api/admin/users','/api/admin/roles'):
+            from user_auth import public_user,PERMISSIONS
+            with LOCK,connect() as db:
+                roles=[{'name':name,'permissions':json.loads(p)} for name,p in db.execute('SELECT name,permissions FROM app_roles ORDER BY name')]
+                result={'roles':roles,'permissions':PERMISSIONS}
+                if self.path.endswith('/users'):result['users']=[public_user(db,id) for id, in db.execute('SELECT id FROM app_users ORDER BY id')]
+            return self.reply(200,result)
         if self.path=='/api/ai/settings':
             from ai_notes import key_status
             self.reply(200,key_status())
@@ -286,14 +354,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write((ROOT/'mockup/index.html').read_bytes())
         elif self.path=='/vendor/lightweight-charts.js':
             self.send_response(200);self.send_header('Content-Type','application/javascript');self.end_headers();self.wfile.write((ROOT/'mockup/vendor/lightweight-charts.js').read_bytes())
-        elif self.path in ('/performance.js','/table-pagination.js','/table-sorting.js','/notes.js','/note-ai.js','/note-ai-main.js','/ai-settings.js','/trader-ui.js','/live-chart-ui.js'):
+        elif self.path in ('/performance.js','/table-pagination.js','/table-sorting.js','/notes.js','/note-ai.js','/note-ai-main.js','/ai-settings.js','/trader-ui.js','/live-chart-ui.js','/ai-logs-ui.js','/users-ui.js'):
             self.send_response(200);self.send_header('Content-Type','application/javascript; charset=utf-8');self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write((ROOT/'mockup'/self.path.lstrip('/')).read_bytes())
         else: self.reply(404,{'error':'Not found'})
     def do_POST(self):
         if self.headers.get('Origin') not in ('http://127.0.0.1:3000','http://localhost:3000'):
             return self.reply(403,{'error':'Origin tidak diizinkan'})
         try:
-            if self.path=='/api/chart':
+            if self.path.startswith('/api/auth/') or self.path in ('/api/admin/users','/api/admin/roles'):
+                return self.auth_post()
+            if not self.auth_gate('POST'):return
+            if self.path=='/api/logs/context':
+                from ai_log_context import retrieve_logs
+                length=int(self.headers.get('Content-Length','0'))
+                if length>15000:raise ValueError('Filter terlalu besar.')
+                data=json.loads(self.rfile.read(length))
+                with LOCK,connect() as db: result=retrieve_logs(load(db) or {},data)
+                self.reply(200,result)
+            elif self.path=='/api/chart':
                 from live_chart import read_live_chart
                 length=int(self.headers.get('Content-Length','0'))
                 if length>4000:raise ValueError('Input chart terlalu besar.')
@@ -305,6 +383,8 @@ class Handler(BaseHTTPRequestHandler):
                 length=int(self.headers.get('Content-Length','0'))
                 if length>15000:raise ValueError('Pesan terlalu besar.')
                 data=json.loads(self.rfile.read(length));broker_id=str(data.get('brokerId',''))
+                from user_auth import require
+                if data.get('includeMarket'):require(self.user,'market.view')
                 with LOCK,connect() as db:
                     state=load(db)
                     if not any(str(b['id'])==broker_id for b in state['brokers']):raise ValueError('Akun trading tidak ditemukan.')
@@ -320,12 +400,16 @@ class Handler(BaseHTTPRequestHandler):
                 message=str(data.get('message','')).strip()
                 if not message or len(message)>5000:raise ValueError('Pesan wajib diisi, maksimal 5.000 karakter.')
                 messages=[{'role':m['role'],'content':m['content']} for m in history[-20:]]+[{'role':'user','content':message}]
-                answer=answer_trader(messages,context)
+                log_context=None
+                if data.get('includeLogs'):
+                    from ai_log_context import retrieve_logs
+                    log_context=retrieve_logs(state,data)
+                answer=answer_trader(messages,context,log_context)
                 with LOCK,connect() as db:
                     stamp=datetime.now(timezone.utc).isoformat()
                     for role,text in [('user',message),('assistant',answer)]:
-                        db.execute('INSERT INTO trader_messages(broker_id,role,content,created_at,context) VALUES(?,?,?,?,?)',(broker_id,role,text,stamp,json.dumps(context) if role=='assistant' and context else None))
-                self.reply(200,{'answer':answer,'context':context})
+                        db.execute('INSERT INTO trader_messages(broker_id,role,content,created_at,context) VALUES(?,?,?,?,?)',(broker_id,role,text,stamp,json.dumps({'marketContext':context,'logContext':log_context}) if role=='assistant' and (context or log_context) else None))
+                self.reply(200,{'answer':answer,'context':context,'logContext':log_context})
             elif self.path=='/api/ai/settings':
                 from ai_notes import configure_ai
                 length=int(self.headers.get('Content-Length','0'))
@@ -337,6 +421,8 @@ class Handler(BaseHTTPRequestHandler):
                 length=int(self.headers.get('Content-Length','0'))
                 if length>100000: raise ValueError('Input AI terlalu besar.')
                 data=json.loads(self.rfile.read(length))
+                from user_auth import require
+                require(self.user,'notes.edit')
                 with LOCK, connect() as db: state=load(db)
                 self.reply(200,draft_note(data,state or {'records':[],'brokers':[]}))
             elif self.path=='/api/notes':
@@ -367,6 +453,10 @@ class Handler(BaseHTTPRequestHandler):
                                 validate_config(config)
                                 if f"{config['server']}:{int(config['login'])}"!=b.get('accountKey'): raise ValueError('Gunakan Tambah akun broker untuk identitas MT5 yang berbeda.')
                     if current: enforce_source_ownership(current,data)
+                    if current:
+                        from user_auth import require
+                        if current['records']!=data['records'] or current['funds']!=data['funds']:require(self.user,'logs.edit')
+                        if current['brokers']!=data['brokers'] or current['settings']!=data['settings']:require(self.user,'settings.manage')
                     restore_imported_prices(db,data)
                     save(db,data)
                 self.reply(200,{'saved':True})
@@ -379,6 +469,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path=='/api/disconnect':
                 self.reply(200,disconnect_active())
             else: self.reply(404,{'error':'Not found'})
+        except PermissionError as exc:self.reply(403,{'error':str(exc)})
         except Exception as exc: self.reply(400,{'error':str(exc)})
     def log_message(self,*args): pass
 

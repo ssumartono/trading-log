@@ -29,7 +29,7 @@ class AITests(unittest.TestCase):
         finally:ai_notes.SERVER_KEY=old
     @patch('ai_notes.urlopen',return_value=FakeResponse())
     def test_summary_and_draft_no_account_identity(self,send):
-        state={'brokers':[{'id':1,'name':'SecretAccount'}],'records':[{'broker':'SecretAccount','date':'2026-10-15','profit':5,'symbol':'XAUUSD'}]}
+        state={'brokers':[{'id':1,'name':'SecretAccount'}],'records':[{'id':1,'time':'09:00','broker':'SecretAccount','date':'2026-10-15','profit':5,'symbol':'XAUUSD'}]}
         result=draft_note({'apiKey':'test-key','kind':'Lesson Learned','prompt':'Evaluasi','includeLogs':True,'brokerId':1,'eventDate':'2026-10-15T09:00'},state)
         self.assertEqual(result['draft'],'Draf evaluasi');payload=json.loads(send.call_args.args[0].data);self.assertFalse(payload['store']);self.assertNotIn('SecretAccount',payload['input']);self.assertNotIn('test-key',payload['input']);self.assertEqual(json.loads(payload['input'])['ringkasanLog']['netProfit'],5)
     @patch.dict('os.environ',{'OPENAI_API_KEY':''})
