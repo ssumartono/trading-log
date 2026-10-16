@@ -24,6 +24,15 @@ class BrokerRegistrationTests(unittest.TestCase):
         self.assertFalse(state['brokers'][0]['integration']['auto'])
         self.assertEqual(str(result['brokerId']),state['settings']['brokerId'])
         with self.assertRaisesRegex(ValueError,'sudah terdaftar'): server.register_broker(self.config)
+    def test_registration_assigns_authenticated_owner(self):
+        import user_auth,account_access
+        with server.connect() as db:
+            user=user_auth.create_user(db,{'username':'owner','displayName':'Owner','password':'Test-password123'},True)
+        result=server.register_broker(self.config,user)
+        with server.connect() as db:
+            self.assertEqual(account_access.ids(db,user),{str(result['brokerId'])})
+            self.assertEqual(account_access.view(db,server.load(db),user)['settings']['brokerId'],str(result['brokerId']))
+
     def test_wrong_terminal_account_does_not_create_broker(self):
         self.mt5.account_info=lambda:SimpleNamespace(login=999,server='Test-Live',currency='USD',balance=100)
         with self.assertRaisesRegex(ValueError,'Login manual ke'): server.register_broker(self.config)

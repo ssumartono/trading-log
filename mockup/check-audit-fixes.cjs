@@ -1,0 +1,17 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const ctx={};vm.createContext(ctx);vm.runInContext(fs.readFileSync(__dirname+'/performance.js','utf8'),ctx);
+assert.equal(ctx.performanceMetrics([{profit:5},{profit:10}]).best,10);
+assert.equal(ctx.performanceMetrics([{profit:5}]).worst,null);
+assert.equal(ctx.performanceMetrics([{profit:-5}]).best,null);
+assert.equal(ctx.performanceMetrics([{profit:-5},{profit:-10}]).worst,-10);
+assert.equal(ctx.performanceMetrics([{profit:0}]).best,null);
+assert.equal(ctx.performanceMetrics([{profit:0}]).worst,null);
+const html=fs.readFileSync(__dirname+'/index.html','utf8');
+const start=html.indexOf('function todayWIB('),end=html.indexOf('const $',start);
+vm.runInContext(html.slice(start,end),ctx);
+assert.equal(ctx.todayWIB(new Date('2026-10-15T18:00:00Z')),'2026-10-16');
+assert.equal(ctx.todayWIB(new Date('2026-10-15T16:59:00Z')),'2026-10-15');
+assert.ok(!html.includes('new Date(2026,9,14)'));
+for(const match of html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g))new vm.Script(match[1]);
+for(const name of ['sync-health-ui.js','live-chart-ui.js'])new vm.Script(fs.readFileSync(__dirname+'/'+name,'utf8'));
+console.log('PASS: positive/negative Max, zero/empty results, current WIB calendar, script syntax');

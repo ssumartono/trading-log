@@ -15,7 +15,7 @@ def retrieve_logs(state,data,now=None):
         if not ticket.isdigit() or len(ticket)>30:raise ValueError('Ticket harus berupa angka.')
     elif period=='day':
         start=end=str(data.get('eventDate') or today.isoformat())[:10]
-    elif period in ('today','7','30','90'):
+    elif period in ('today','3','7','30','90'):
         end=today.isoformat();start=(today-timedelta(days=0 if period=='today' else int(period)-1)).isoformat()
     elif period=='custom':start=str(data.get('logStart',''));end=str(data.get('logEnd',''))
     elif period!='all':raise ValueError('Periode log tidak valid.')

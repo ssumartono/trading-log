@@ -1,0 +1,10 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),ctx={};vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(__dirname+'/trader-ui.js','utf8'),ctx);
+const sample='# Analisis\n\n**Fakta** market.\n\n| Kondisi | Harga |\n| :--- | ---: |\n| Support | **100** |\n| Resistance | 110 |\n\n1. Tunggu konfirmasi\n2. Evaluasi risiko\n\n> Snapshot terakhir\n\n```\n<img src=x onerror=alert(1)>\n```';
+const result=ctx.traderMarkdown(sample);
+for(const tag of ['<h3>Analisis</h3>','<strong>Fakta</strong>','<table>','<thead>','<tbody>','<ol start="1">','<blockquote>','<pre><code>'])assert.ok(result.includes(tag),tag);
+assert.ok(result.includes('&lt;img'));assert.ok(!result.includes('<img'));
+const hostile=ctx.traderMarkdown('<script>alert(1)</script>\n\n| A | B |\n| --- | --- |\n| <svg onload=alert(1)> | `safe` |');assert.ok(!hostile.includes('<script>'));assert.ok(!hostile.includes('<svg'));assert.ok(hostile.includes('<code>safe</code>'));
+assert.equal(ctx.traderMarkdown(null),'');
+for(const file of ['table-sorting.js','table-pagination.js'])assert.ok(fs.readFileSync(__dirname+'/'+file,'utf8').includes("table.closest('.trader-text')"));
+console.log('PASS: tables, headings, lists, code, escaped HTML and chat tables retain answer order');

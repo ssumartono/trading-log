@@ -1,10 +1,12 @@
 # TradingLog
 
-Aplikasi jurnal trading lokal dengan SQLite, integrasi MetaTrader 5, dan tampilan bergaya Outlook. Mendukung desktop, tablet, mobile, serta tema Light/Dark.
+Aplikasi jurnal trading lokal dengan SQLite, integrasi MetaTrader 5, dan tampilan bergaya Fluent. Mendukung desktop, tablet, mobile, serta tema Light/Dark.
 
 ## Fitur
 
-- Live Chart sebagai halaman awal: candlestick, volume, timeframe M1–D1, pembaruan setiap 5 detik dan posisi terbuka. Menggunakan TradingView Lightweight Charts.
+- Dashboard sebagai Home, dengan ringkasan akun dan akses cepat.
+- Live Chart: candlestick, timeframe M1–D1, pembaruan setiap 5 detik, serta garis Entry/TP/SL. Default tanpa indikator dan tanpa grafik volume.
+- Indicators Library: Load beberapa Range Oscillator dengan periode/multiplier berbeda, hapus per panel atau sekaligus. Pilihan disimpan per pengguna dan akun di browser. Indikator lainnya berstatus MT5 saja.
 - Dashboard per akun, waterfall saldo, filter periode, dan riwayat transaksi.
 - Kalender trading hingga jam, tabel log, sort dan pagination.
 - Pengaturan broker, tes koneksi, sinkronisasi MT5 dan riwayat Deposit/Withdraw.
@@ -12,7 +14,11 @@ Aplikasi jurnal trading lokal dengan SQLite, integrasi MetaTrader 5, dan tampila
 - Catatan Harian, Memo, Event dan Lesson Learned dengan mailbox dan editor panel kanan.
 - AI Assistant untuk draf catatan dan AI Trader Assistant dengan konteks market opsional.
 - Integrasi AI baca-saja ke log SQLite: filter akun/periode/simbol/ticket, pratinjau dan sumber log.
-- Login, profil pengguna, Administrator, Management Users dan Rules & Access berbasis role.
+- Login, profil pengguna, Administrator, serta Manajemen Pengguna dan Peran & Hak Akses dalam tab.
+- Kepemilikan akun: pengguna hanya mengakses akun miliknya, termasuk Administrator; transfer akun melalui Manajemen Pengguna.
+- Pengaturan, Broker dan Analisa Performa Trading menggunakan tab. Pemilih akun aktif dan header akun tersedia di halaman trading.
+- Lampiran screenshot, Backup/Restore, Audit Trail, dan Broker Time System.
+- Respons aplikasi ditingkatkan melalui koneksi baca SQLite WAL, pemisahan sinkronisasi MT5, dan penyimpanan perubahan saja.
 - Indikator MT5 tambahan pada folder `indicators`; lihat panduan masing-masing.
 
 ## Menjalankan di Windows
@@ -48,9 +54,9 @@ Satu terminal menggunakan satu akun aktif. Data dicatat per deal, sehingga Entry
 
 ## AI opsional
 
-Di **Pengaturan → Setup API Key**, pilih AI Platform, URL, Model Name dan API Key. OpenAI memakai endpoint `/v1/responses`; OpenAI Compatible memakai endpoint `/chat/completions`.
+Di **Administrator → API Key**, pilih AI Platform, URL, Model Name dan API Key. OpenAI memakai endpoint `/v1/responses`; OpenAI Compatible memakai endpoint `/chat/completions`.
 
-Konfigurasi disimpan di memori server dan hilang setelah restart. Alternatif untuk OpenAI: environment `OPENAI_API_KEY` dan `OPENAI_MODEL`. Jangan memasukkan key ke source control. AI hanya menghasilkan draf/diskusi; tidak mengeksekusi order. Konteks market/log hanya dikirim ke penyedia AI ketika opsi tersebut dipilih.
+Konfigurasi dan API key disimpan terenkripsi dengan Windows DPAPI untuk pengguna Windows saat ini. Alternatif untuk OpenAI: environment `OPENAI_API_KEY` dan `OPENAI_MODEL`. Jangan memasukkan key ke source control. AI hanya menghasilkan draf/diskusi; tidak mengeksekusi order. Konteks market/log hanya dikirim ke penyedia AI ketika opsi tersebut dipilih.
 
 Aktifkan **Sertakan log SQLite** untuk membaca data akun terpilih melalui backend: periode, simbol, Ticket/Order/Position ID. **Pratinjau log SQLite** bekerja tanpa API key. AI menerima ringkasan seluruh hasil filter dan maksimal 40 detail relevan, termasuk strategi/indikator/catatan. Hasil pencarian tidak dapat mengubah database. Kotak chat otomatis menampilkan percakapan terbaru.
 
@@ -60,6 +66,7 @@ SQLite dibuat otomatis pada `data/tradinglog.sqlite3`. Folder data, API key, kre
 
 ```powershell
 python -m unittest discover -p "test_*.py"
+node --test test_app_ui.cjs test_state_persistence.cjs test_range_oscillator_ui.cjs test_indicators_library.cjs
 ```
 
 Pengujian memakai data buatan/database sementara; bukan transaksi sungguhan. Fitur Trading Plan tidak disertakan karena telah dibatalkan.
@@ -69,3 +76,7 @@ Pengujian memakai data buatan/database sementara; bukan transaksi sungguhan. Fit
 TradingView Lightweight Charts™ 5.2.0 disertakan pada `mockup/vendor/` dengan LICENSE dan NOTICE aslinya. Copyright (c) 2025 TradingView, Inc. https://www.tradingview.com/
 
 Lihat komentar dan panduan dalam `indicators/` untuk asal-usul dan ketentuan kode indikator masing-masing.
+
+## Dokumentasi tambahan
+
+Lihat [Indicators Library](docs/indicators-library.md), [Range Oscillator](docs/range-oscillator-live-chart.md), [lampiran](docs/screenshot-attachments.md), dan [Backup/Restore](docs/backup-restore-audit.md).

@@ -20,13 +20,28 @@ class HTTPAuthTests(unittest.TestCase):
             try:
                 self.assertEqual(call('/api/state')[0],401)
                 status,result,admin=call('/api/auth/setup',{'username':'admin','displayName':'Administrator','password':'Test-password123'});self.assertEqual(status,200)
+                # Polling must remain available while a sync owns the write lock.
+                with server.LOCK,server.connect() as db:
+                    from sync_health import update_status
+                    update_status(db,1,{'status':'running'})
+                    self.assertEqual(call('/api/sync/status',cookie=admin)[0],200)
+                self.assertEqual(call('/api/sync/status')[0],401)
                 self.assertEqual(call('/api/state',cookie=admin)[0],200)
                 self.assertEqual(call('/api/admin/users',{'username':'reader','displayName':'Reader','password':'Test-password123','role':'Viewer'},admin)[0],200)
                 _,_,reader=call('/api/auth/login',{'username':'reader','password':'Test-password123'})
+                self.assertEqual(call('/api/preferences',cookie=reader)[1]['timezone'],'WIB')
+                self.assertEqual(call('/api/preferences',{'timezone':'UTC'},reader)[0],403)
+                self.assertEqual(call('/api/preferences',{'timezone':'UTC'},admin)[0],200)
+                self.assertEqual(call('/api/preferences',cookie=reader)[1]['timezone'],'WIB')
+                self.assertEqual(call('/api/strategies',cookie=reader)[0],200)
+                self.assertEqual(call('/api/strategies',{'name':'Forbidden'},reader)[0],403)
+                status,created,_=call('/api/strategies',{'name':'HTTP test','whenApplied':'Range','rules':'Rule','status':'Aktif'},admin)
+                self.assertEqual(status,200)
+                self.assertEqual(call('/api/strategies',dict(created,delete=True),admin)[0],200)
                 self.assertEqual(call('/api/admin/users',cookie=reader)[0],403)
                 self.assertEqual(call('/api/ai/settings',cookie=reader)[0],403)
                 self.assertEqual(call('/api/notes',{'title':'Forbidden'},reader)[0],403)
-                _,state,_=call('/api/state',cookie=reader);edited=copy.deepcopy(state);edited['records'][0]['note']='Should not save';edited['_base']=state
+                _,state,_=call('/api/state',cookie=reader);edited=copy.deepcopy(state);edited['records']=[{'id':1,'broker':'Other Account','note':'Should not save'}];edited['_base']=state
                 self.assertEqual(call('/api/state',edited,reader)[0],403)
                 self.assertEqual(call('/api/auth/logout',{},reader)[0],200)
                 self.assertEqual(call('/api/state',cookie=reader)[0],401)

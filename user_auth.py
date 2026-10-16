@@ -2,8 +2,8 @@
 import hashlib,hmac,json,re,secrets,time
 from http.cookies import SimpleCookie
 
-PERMISSIONS={'data.view':'Lihat dashboard, log & analisis','logs.edit':'Edit log dan mutasi manual','market.view':'Live Chart & snapshot MT5','notes.view':'Baca catatan','notes.edit':'Buat/edit catatan','ai.use':'Gunakan AI Assistant','sync.manage':'Tes koneksi & sinkronisasi','settings.manage':'Konfigurasi broker & API AI','users.manage':'Management Users','roles.manage':'Rules & Access'}
-DEFAULTS={'Administrator':list(PERMISSIONS),'Trader':['data.view','logs.edit','market.view','notes.view','notes.edit','ai.use'],'Viewer':['data.view','market.view','notes.view']}
+PERMISSIONS={'broker.manage':'Kelola akun broker dan integrasi MT5 sendiri','backup.manage':'Backup dan Restore SQLite','audit.view':'Lihat Audit Trail','data.view':'Lihat dashboard, log & analisis','logs.edit':'Edit log dan mutasi manual','market.view':'Live Chart & snapshot MT5','notes.view':'Baca catatan','notes.edit':'Buat/edit catatan','ai.use':'Gunakan AI Assistant','sync.manage':'Tes koneksi & sinkronisasi','settings.manage':'Konfigurasi API AI server','users.manage':'Manajemen Pengguna','roles.manage':'Peran & Hak Akses'}
+DEFAULTS={'Administrator':list(PERMISSIONS),'Trader':['broker.manage','sync.manage','data.view','logs.edit','market.view','notes.view','notes.edit','ai.use'],'Viewer':['data.view','market.view','notes.view']}
 
 def schema(db):
     db.execute('CREATE TABLE IF NOT EXISTS app_roles(name TEXT PRIMARY KEY,permissions TEXT NOT NULL)')
@@ -58,6 +58,9 @@ def create_user(db,data,first=False):
     if not db.execute('SELECT 1 FROM app_roles WHERE name=?',(role,)).fetchone():raise ValueError('Role tidak ditemukan.')
     if db.execute('SELECT 1 FROM app_users WHERE username=?',(username,)).fetchone():raise ValueError('Username sudah terdaftar.')
     row=db.execute('INSERT INTO app_users(username,display_name,email,password_hash,role) VALUES(?,?,?,?,?)',(username,name,email,password_hash(data.get('password','')),role))
+    if first:
+        from account_access import migrate_legacy_owners
+        migrate_legacy_owners(db)
     return public_user(db,row.lastrowid)
 
 def login(db,data):
@@ -96,6 +99,11 @@ def save_role(db,data):
     db.execute('INSERT INTO app_roles VALUES(?,?) ON CONFLICT(name) DO UPDATE SET permissions=excluded.permissions',(name,json.dumps(sorted(set(permissions)))))
 
 def endpoint_permission(path,method):
+    if path.startswith('/api/admin/backup/'):return 'backup.manage'
+    if path=='/api/admin/audit':return 'audit.view'
+    if path=='/api/preferences':return 'data.view' if method=='GET' else 'broker.manage'
+    if path=='/api/strategies':return 'data.view' if method=='GET' else 'logs.edit'
+    if path=='/api/sync/status':return 'data.view'
     if path=='/api/state':return 'data.view'
     if path=='/api/notes':return 'notes.view' if method=='GET' else 'notes.edit'
     if path in ('/api/chart','/api/trader/context'):return 'market.view'
@@ -105,5 +113,5 @@ def endpoint_permission(path,method):
     if path in ('/api/notes/ai','/api/trader/chat','/api/trader/history','/api/trader/clear'):return 'ai.use'
     if path=='/api/logs/context':return 'data.view'
     if path in ('/api/sync','/api/connection','/api/disconnect'):return 'sync.manage'
-    if path=='/api/brokers/register':return 'settings.manage'
+    if path=='/api/brokers/register':return 'broker.manage'
     return None

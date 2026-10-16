@@ -1,6 +1,9 @@
 """Local TradingLog API and read-only MT5 importer."""
 import json, sqlite3, threading, time
 import copy
+from functools import wraps
+import audit_trail
+import account_access
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -9,31 +12,74 @@ ROOT = Path(__file__).resolve().parent
 DB = ROOT / 'data' / 'tradinglog.sqlite3'
 DB.parent.mkdir(exist_ok=True)
 LOCK = threading.RLock()
+SCHEMA_LOCK = threading.RLock()
+MT5_LOCK = threading.RLock()
+INITIALIZED_DATABASES = set()
+RESTORE_GENERATION=0
 WIB = timezone(timedelta(hours=7))
+
+def terminal_operation(function):
+    @wraps(function)
+    def locked(*args,**kwargs):
+        with MT5_LOCK:return function(*args,**kwargs)
+    return locked
+
 
 class DatabaseConnection(sqlite3.Connection):
     def __exit__(self,*args):
         try:return super().__exit__(*args)
         finally:self.close()
 
+def readonly():
+    return sqlite3.connect(DB.as_uri()+'?mode=ro',uri=True,factory=DatabaseConnection)
+
 def connect():
+    if getattr(audit_trail.context,'generation',RESTORE_GENERATION)!=RESTORE_GENERATION:raise ValueError('Workspace telah direstore. Muat ulang dan login kembali.')
     db = sqlite3.connect(DB,timeout=30,factory=DatabaseConnection)
+    audit_trail.register(db)
+    try:
+        identity=(str(DB.resolve()),DB.stat().st_ino)
+        with SCHEMA_LOCK:
+            if identity not in INITIALIZED_DATABASES:
+                initialize_schema(db)
+                db.commit()
+                INITIALIZED_DATABASES.add(identity)
+        return db
+    except Exception:
+        db.close()
+        raise
+
+
+def initialize_schema(db):
     db.execute('PRAGMA journal_mode=WAL')
     db.execute('CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS mt5_deals (server TEXT, login INTEGER, ticket INTEGER, data TEXT NOT NULL, PRIMARY KEY(server,login,ticket))')
     db.execute('CREATE TABLE IF NOT EXISTS sync_runs (id INTEGER PRIMARY KEY, time TEXT, result TEXT)')
+    db.execute('CREATE TABLE IF NOT EXISTS sync_status(broker_id TEXT PRIMARY KEY,data TEXT NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS balance_checkpoints(account_key TEXT PRIMARY KEY,data TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS daily_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1)')
     db.execute('CREATE TABLE IF NOT EXISTS trader_messages (id INTEGER PRIMARY KEY AUTOINCREMENT,broker_id TEXT,role TEXT,content TEXT,created_at TEXT,context TEXT)')
     from user_auth import schema
     schema(db)
-    return db
+    account_access.schema(db)
+    from strategies import schema as strategy_schema
+    strategy_schema(db)
+    from app_preferences import schema as preferences_schema
+    preferences_schema(db)
+    import attachments
+    attachments.schema(db)
+    audit_trail.schema(db)
 
 def load(db):
     row = db.execute('SELECT data FROM state WHERE id=1').fetchone()
     return json.loads(row[0]) if row else None
 
 def save(db, state):
+    audit_trail.state_changes(db,load(db),state)
+    from attachments import prune
+    prune(db,state)
     db.execute('INSERT INTO state VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', (json.dumps(state),))
+    account_access.migrate_legacy_owners(db,state)
 
 def apply_deal_price(row, deal):
     if 'order' in deal: row['orderId']=str(deal['order'])
@@ -47,10 +93,17 @@ def apply_deal_price(row, deal):
     row['exit']=deal['price'] if deal['entry'] in (1,3) else None
 
 def restore_imported_prices(db,state):
+    from time_rules import wib_fields
+    configs={b.get('accountKey'):b.get('integration',{}) for b in state['brokers']}
     raw={f'{srv}:{login}:{ticket}':json.loads(data) for srv,login,ticket,data in db.execute('SELECT server,login,ticket,data FROM mt5_deals')}
     for row in state['records']:
         deal=raw.get(row.get('sourceKey'))
-        if deal: apply_deal_price(row,deal)
+        if deal:
+            apply_deal_price(row,deal)
+            row.update(wib_fields(deal['time'],configs.get(row.get('accountKey'),{})))
+    for row in state['funds']:
+        deal=raw.get(row.get('sourceKey'))
+        if deal:row.update(wib_fields(deal['time'],configs.get(row.get('accountKey'),{})))
 
 def enforce_source_ownership(current, incoming):
     for name,editable in [('records',{'strategy','indicator','note'}),('funds',{'note'})]:
@@ -103,6 +156,8 @@ def merge_manual_edits(current, incoming, base):
     return result
 
 def validate_config(config):
+    from time_rules import validate_time_config
+    validate_time_config(config)
     config['path']=str(config.get('path','')).strip().strip('"')
     config['server']=str(config.get('server','')).strip()
     config['login']=str(config.get('login','')).strip()
@@ -110,7 +165,8 @@ def validate_config(config):
         raise ValueError('Nomor akun, server, dan lokasi terminal wajib diisi.')
     datetime.fromisoformat(config['start'])
 
-def register_broker(config):
+@terminal_operation
+def register_broker(config, user=None):
     import MetaTrader5 as mt5
     validate_config(config)
     with LOCK, connect() as db:
@@ -128,20 +184,26 @@ def register_broker(config):
             if account.currency!='USD': raise ValueError('Versi ini mendukung akun USD.')
             config=dict(config,enabled=True,auto=False)
             broker={'id':max([b['id'] for b in state['brokers']]+[0])+1,'name':f'{account.server} · {account.login}','initial':account.balance,'accountKey':key,'integration':config}
-            config['brokerId']=str(broker['id']);state['brokers'].append(broker);state['settings']=config
+            config['brokerId']=str(broker['id']);state['brokers'].append(broker)
+            if user:
+                db.execute('INSERT INTO broker_owners VALUES(?,?)',(str(broker['id']),user['id']))
+                db.execute('INSERT INTO user_account_settings VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data',(user['id'],json.dumps(config)))
+            else:state['settings']=config
             state['syncRevision']=state.get('syncRevision',0)+1
             save(db,state)
             return {'message':'Koneksi berhasil. Broker terdaftar; pilih Sync sekarang untuk mengimpor riwayat.','brokerId':broker['id']}
         finally: mt5.shutdown()
 
-def disconnect_active():
+@terminal_operation
+def disconnect_active(user=None):
     import MetaTrader5 as mt5
     with LOCK, connect() as db:
         state=load(db)
         if not state: raise ValueError('Buka aplikasi terlebih dahulu.')
-        settings=state['settings']
+        settings=(account_access.view(db,state,user) if user else state)['settings']
         # A single terminal can serve only one logged-in account at a time.
         for item in state['brokers']:
+            if user and str(item['id']) not in account_access.ids(db,user):continue
             config=item.get('integration',{})
             if str(config.get('path','')).replace('\\','/').lower()==str(settings.get('path','')).replace('\\','/').lower():
                 config['enabled']=False
@@ -156,102 +218,161 @@ def disconnect_active():
             broker['integration']=config
         settings['enabled']=False
         settings['auto']=False
+        if user:db.execute('INSERT INTO user_account_settings VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data',(user['id'],json.dumps(settings)))
         mt5.shutdown()
         state['syncRevision']=state.get('syncRevision',0)+1
         save(db,state)
         return {'message':'Integrasi broker aktif dilepas. Login ke akun baru di terminal MT5, lalu tes koneksi.'}
 
 def synchronize(test=False, broker_id=None):
+    from sync_health import update_status
+    started=time.time();stamp=datetime.now(timezone.utc).isoformat()
+    with LOCK,connect() as db:
+        state=load(db);broker_id=broker_id or (state or {}).get('settings',{}).get('brokerId')
+        broker=next((b for b in (state or {}).get('brokers',[]) if str(b['id'])==str(broker_id)),None)
+        if not broker:raise ValueError('Akun broker tidak ditemukan.')
+        generation=RESTORE_GENERATION
+        actor=getattr(audit_trail.context,'actor',None)
+        if actor and actor.get('id'):account_access.require_broker(db,actor,broker_id)
+        update_status(db,broker_id,{'status':'running','lastAttempt':stamp,'operation':'connection' if test else 'sync','error':None,'accountName':broker['name']})
+    try:
+        result=_synchronize(test,broker_id)
+        with LOCK,connect() as db:
+            if generation!=RESTORE_GENERATION:raise ValueError('Workspace telah direstore. Muat ulang dan login kembali.')
+            changes={'status':'connected' if test else 'success','lastFinished':datetime.now(timezone.utc).isoformat(),'durationSeconds':round(time.time()-started,2),'error':None,'message':result['message']}
+            if not test:changes.update(lastSuccess=result['time'],deals=result['deals'],new=result['new'],updated=result['updated'],latestTicket=result['latestTicket'],reconciliation=result['reconciliation'])
+            update_status(db,broker_id,changes)
+            audit_trail.event(db,'connection_test' if test else 'sync_success','synchronization',broker_id,None,{'message':result['message'],'new':result.get('new'),'updated':result.get('updated')})
+            if test:db.execute('INSERT INTO sync_runs(time,result) VALUES(?,?)',(stamp,json.dumps(dict(result,brokerId=broker_id,status='connected'))))
+        return result
+    except Exception as exc:
+        with LOCK,connect() as db:
+            if generation!=RESTORE_GENERATION:raise
+            update_status(db,broker_id,{'status':'failed','error':str(exc),'message':str(exc),'lastFinished':datetime.now(timezone.utc).isoformat(),'durationSeconds':round(time.time()-started,2)})
+            audit_trail.event(db,'sync_failed','synchronization',broker_id,None,{'error':str(exc)})
+            db.execute('INSERT INTO sync_runs(time,result) VALUES(?,?)',(stamp,json.dumps({'brokerId':broker_id,'status':'failed','error':str(exc)})))
+        raise
+
+@terminal_operation
+def _synchronize(test=False, broker_id=None):
     import MetaTrader5 as mt5
-    with LOCK, connect() as db:
-        state = load(db)
-        if not state:
-            raise ValueError('Buka aplikasi terlebih dahulu.')
+    def configuration(state):
+        broker=next((b for b in (state or {}).get('brokers',[]) if str(b['id'])==str(broker_id)),None)
+        if not broker:raise ValueError('Daftarkan akun broker melalui Pengaturan terlebih dahulu.')
+        config=broker.get('integration') or (state.get('settings',{}) if str(state.get('settings',{}).get('brokerId'))==str(broker_id) else {})
+        if not config:raise ValueError('Konfigurasikan integrasi MT5 untuk akun ini melalui Pengaturan.')
+        return broker,copy.deepcopy(config)
+    with LOCK,connect() as db:
+        state=load(db)
+        if not state:raise ValueError('Buka aplikasi terlebih dahulu.')
         broker_id=broker_id or state['settings'].get('brokerId')
-        configured=next((b for b in state['brokers'] if str(b['id'])==str(broker_id)),None)
-        if configured is None: raise ValueError('Daftarkan akun broker melalui Pengaturan terlebih dahulu.')
-        config = configured.get('integration') or state['settings']
-        validate_config(config)
-        if not config.get('enabled'):
-            raise ValueError('Aktifkan integrasi MT5 pada Pengaturan.')
-        try:
-            if not mt5.initialize(config['path'], timeout=15000):
-                raise ValueError('Koneksi MT5 gagal: ' + str(mt5.last_error()))
-            account = mt5.account_info()
-            terminal = mt5.terminal_info()
-            if not account or not terminal.connected:
-                raise ValueError('Terminal MT5 belum terhubung.')
-            if account.login != int(config['login']) or account.server != config['server']:
-                raise ValueError('Akun/server aktif di terminal berbeda dari Pengaturan. Login ke akun yang sesuai di MT5.')
-            if account.currency != 'USD':
-                raise ValueError('Versi aplikasi ini hanya mendukung akun USD.')
-            if test:
-                return {'message': f'Terhubung ke {account.login} · {account.server} · {account.currency}'}
-            start = datetime.fromisoformat(config['start']).replace(tzinfo=WIB).astimezone(timezone.utc)
-            now = datetime.now(timezone.utc)
-            if start > now:
-                raise ValueError('Tanggal impor tidak boleh di masa depan.')
-            # Some broker histories expose server-wall-clock timestamps ahead of UTC.
-            # The terminal returns executed history only; allow a one-day query margin.
-            deals = mt5.history_deals_get(start, now + timedelta(days=1))
-            if deals is None:
-                raise ValueError('Riwayat MT5 gagal: ' + str(mt5.last_error()))
-            key = f'{account.server}:{account.login}'
-            brokers = state['brokers']
-            broker = next((b for b in brokers if b.get('accountKey') == key), None)
-            if broker is None or broker['id']!=configured['id']:
-                raise ValueError('Identitas akun berbeda. Tambahkan akun baru melalui Pengaturan.')
-            broker['integration']=config
-            config['brokerId'] = str(broker['id'])
-            config['enabled'] = True
-            net = lambda d: sum(float(getattr(d, k, 0)) for k in ('profit','commission','swap','fee'))
-            broker['initial'] = round(account.balance - sum(net(d) for d in deals), 2)
-            broker['mt5Balance'] = account.balance
-            broker['mt5Equity'] = account.equity
-            added = 0
-            for deal in deals:
-                raw = deal._asdict()
-                existing = db.execute('SELECT 1 FROM mt5_deals WHERE server=? AND login=? AND ticket=?', (account.server,account.login,deal.ticket)).fetchone()
-                added += not bool(existing)
-                db.execute('INSERT INTO mt5_deals VALUES(?,?,?,?) ON CONFLICT(server,login,ticket) DO UPDATE SET data=excluded.data', (account.server,account.login,deal.ticket,json.dumps(raw)))
-                stamp = datetime.fromtimestamp(deal.time, timezone.utc).astimezone(WIB)
-                source = key + ':' + str(deal.ticket)
-                base = {'sourceKey': source, 'date': stamp.strftime('%Y-%m-%d'), 'time': stamp.strftime('%H:%M'), 'ticket': str(deal.ticket), 'accountKey':key}
-                if deal.type in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL) and config.get('importTrades'):
-                    # Each row is an execution deal, not an invented round-trip position.
-                    collection = state['records']
-                    row = next((r for r in collection if r.get('sourceKey') == source), None)
-                    if row is None:
-                        row = {'id':max([r['id'] for r in collection]+[0])+1, 'strategy':'', 'indicator':'', 'note':''}
-                        collection.append(row)
-                    row.update(base)
-                    row.update(symbol=deal.symbol, side='Buy' if deal.type==mt5.DEAL_TYPE_BUY else 'Sell', broker=broker['name'], lot=deal.volume,
-                               profit=round(net(deal), 2), entry=deal.price, exit=deal.price, mt5Entry=int(deal.entry), positionId=str(deal.position_id),
-                               status={0:'Entry',1:'Exit',2:'Reversal',3:'Close by'}.get(deal.entry,'Deal'), commission=deal.commission, swap=deal.swap, fee=deal.fee)
-                    apply_deal_price(row,raw)
-                elif deal.type not in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL) and config.get('importFunds'):
-                    collection=state['funds']
-                    row=next((f for f in collection if f.get('sourceKey')==source),None)
-                    if row is None:
-                        row={'id':max([f['id'] for f in collection]+[0])+1,'note':deal.comment or ''}
-                        collection.append(row)
-                    amount=net(deal)
-                    kind=('Deposit' if amount>=0 else 'Withdraw') if deal.type==mt5.DEAL_TYPE_BALANCE else 'Adjustment'
-                    row.update(base)
-                    row.update(brokerId=broker['id'],type=kind,amount=abs(amount),signedAmount=amount,mt5Type=int(deal.type))
-            # Keep the opening balance consistent with ALL retained imported history,
-            # even if the user narrows the import window after an earlier full import.
-            retained=[json.loads(data) for data, in db.execute('SELECT data FROM mt5_deals WHERE server=? AND login=?',(account.server,account.login))]
-            broker['initial']=round(account.balance-sum(sum(float(d.get(k,0)) for k in ('profit','commission','swap','fee')) for d in retained),2)
-            result={'message':f'Sinkronisasi selesai: {len(deals)} deal diperiksa, {added} deal baru.', 'time':now.isoformat(), 'deals':len(deals),'new':added}
-            config['lastSync']=result['time'];config['lastMessage']=result['message']
-            if str(state['settings'].get('brokerId'))==str(broker['id']): state['settings']=dict(config)
-            state['syncRevision']=state.get('syncRevision',0)+1
-            save(db,state)
-            db.execute('INSERT INTO sync_runs(time,result) VALUES(?,?)',(result['time'],json.dumps(result)))
-            return result
-        finally:
-            mt5.shutdown()
+        configured,config=configuration(state)
+        owner=db.execute('SELECT user_id FROM broker_owners WHERE broker_id=?',(str(broker_id),)).fetchone()
+        generation=RESTORE_GENERATION
+        actor=getattr(audit_trail.context,'actor',None)
+        if actor and actor.get('id'):account_access.require_broker(db,actor,broker_id)
+    expected_config=copy.deepcopy(config)
+    validate_config(config)
+    if not config.get('enabled'):raise ValueError('Aktifkan integrasi MT5 pada Pengaturan.')
+    try:
+        if not mt5.initialize(config['path'],timeout=15000):raise ValueError('Koneksi MT5 gagal: '+str(mt5.last_error()))
+        account=mt5.account_info();terminal=mt5.terminal_info()
+        if not account or not terminal or not terminal.connected:raise ValueError('Terminal MT5 belum terhubung.')
+        if account.login!=int(config['login']) or account.server!=config['server']:
+            raise ValueError(f"Terminal aktif: {account.login} / {account.server}; akun yang diminta: {config['login']} / {config['server']}. Login ke akun yang sesuai di MT5.")
+        if account.currency!='USD':raise ValueError('Versi aplikasi ini hanya mendukung akun USD.')
+        if not test:
+            start=datetime.fromisoformat(config['start']).replace(tzinfo=WIB).astimezone(timezone.utc)
+            now=datetime.now(timezone.utc)
+            if start>now:raise ValueError('Tanggal impor tidak boleh di masa depan.')
+            from time_rules import validate_time_config,wib_fields
+            offset=timedelta(minutes=validate_time_config(config))
+            deals=mt5.history_deals_get(start+offset,now+offset+timedelta(days=1))
+            if deals is None:raise ValueError('Riwayat MT5 gagal: '+str(mt5.last_error()))
+    finally:
+        mt5.shutdown()
+    with LOCK,connect() as db:
+        if generation!=RESTORE_GENERATION:raise ValueError('Workspace telah direstore. Muat ulang dan login kembali.')
+        state=load(db);configured,current_config=configuration(state)
+        current_owner=db.execute('SELECT user_id FROM broker_owners WHERE broker_id=?',(str(broker_id),)).fetchone()
+        if current_owner!=owner:raise PermissionError('Pemilik akun berubah selama sinkronisasi. Muat ulang aplikasi.')
+        if current_config!=expected_config:raise ValueError('Pengaturan akun berubah selama sinkronisasi. Coba lagi.')
+        if actor and actor.get('id'):account_access.require_broker(db,actor,broker_id)
+        if test:return {'message':f'Terhubung ke {account.login} · {account.server} · {account.currency}'}
+        key = f'{account.server}:{account.login}'
+        brokers = state['brokers']
+        broker = next((b for b in brokers if b.get('accountKey') == key), None)
+        if broker is None or broker['id']!=configured['id']:
+            raise ValueError('Identitas akun berbeda. Tambahkan akun baru melalui Pengaturan.')
+        broker['integration']=config
+        config['brokerId'] = str(broker['id'])
+        config['enabled'] = True
+        net = lambda d: sum(float(getattr(d, k, 0)) for k in ('profit','commission','swap','fee'))
+        from sync_health import checkpoint,reconcile
+        previous_raw=[json.loads(data) for data, in db.execute('SELECT data FROM mt5_deals WHERE server=? AND login=?',(account.server,account.login))]
+        saved_checkpoint=db.execute('SELECT data FROM balance_checkpoints WHERE account_key=?',(key,)).fetchone()
+        baseline=json.loads(saved_checkpoint[0]) if saved_checkpoint else None
+        new_baseline=False
+        if baseline is None and 'mt5Balance' in broker:
+            baseline=checkpoint(broker['mt5Balance'],previous_raw,config.get('lastSync') or now.isoformat(),'previous_mt5_snapshot')
+        broker['mt5Balance'] = account.balance
+        broker['mt5Equity'] = account.equity
+        added = 0;updated=0
+        raw_by_ticket={str(row['ticket']):row for row in previous_raw}
+        record_by_source={row.get('sourceKey'):row for row in state['records'] if row.get('sourceKey')}
+        fund_by_source={row.get('sourceKey'):row for row in state['funds'] if row.get('sourceKey')}
+        next_record_id=max([r['id'] for r in state['records']]+[0])+1
+        next_fund_id=max([r['id'] for r in state['funds']]+[0])+1
+        for deal in deals:
+            raw = deal._asdict()
+            existing=raw_by_ticket.get(str(deal.ticket))
+            added+=existing is None
+            updated+=bool(existing is not None and existing!=raw)
+            if existing!=raw:db.execute('INSERT INTO mt5_deals VALUES(?,?,?,?) ON CONFLICT(server,login,ticket) DO UPDATE SET data=excluded.data', (account.server,account.login,deal.ticket,json.dumps(raw)))
+            source = key + ':' + str(deal.ticket)
+            base = dict(wib_fields(deal.time,config),sourceKey=source,ticket=str(deal.ticket),accountKey=key)
+            if deal.type in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL) and config.get('importTrades'):
+                # Each row is an execution deal, not an invented round-trip position.
+                collection = state['records']
+                row = record_by_source.get(source)
+                if row is None:
+                    row = {'id':next_record_id, 'strategy':'', 'indicator':'', 'note':''}
+                    next_record_id+=1
+                    collection.append(row);record_by_source[source]=row
+                row.update(base)
+                row.update(symbol=deal.symbol, side='Buy' if deal.type==mt5.DEAL_TYPE_BUY else 'Sell', broker=broker['name'], lot=deal.volume,
+                           profit=round(net(deal), 2), entry=deal.price, exit=deal.price, mt5Entry=int(deal.entry), positionId=str(deal.position_id),
+                           status={0:'Entry',1:'Exit',2:'Reversal',3:'Close by'}.get(deal.entry,'Deal'), commission=deal.commission, swap=deal.swap, fee=deal.fee)
+                apply_deal_price(row,raw)
+            elif deal.type not in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL) and config.get('importFunds'):
+                collection=state['funds']
+                row=fund_by_source.get(source)
+                if row is None:
+                    row={'id':next_fund_id,'note':deal.comment or ''}
+                    next_fund_id+=1
+                    collection.append(row);fund_by_source[source]=row
+                amount=net(deal)
+                kind=('Deposit' if amount>=0 else 'Withdraw') if deal.type==mt5.DEAL_TYPE_BALANCE else 'Adjustment'
+                row.update(base)
+                row.update(brokerId=broker['id'],type=kind,amount=abs(amount),signedAmount=amount,mt5Type=int(deal.type))
+        # Estimate once on first import; later observations never rewrite this anchor.
+        retained=[json.loads(data) for data, in db.execute('SELECT data FROM mt5_deals WHERE server=? AND login=?',(account.server,account.login))]
+        if baseline is None:
+            from sync_health import net as raw_net
+            broker['initial']=round(account.balance-sum(raw_net(d) for d in retained),2)
+            broker['openingBalanceBasis']='estimated_once_on_first_import'
+            baseline=checkpoint(account.balance,retained,now.isoformat(),'first_import_observation');new_baseline=True
+        db.execute('INSERT OR IGNORE INTO balance_checkpoints VALUES(?,?)',(key,json.dumps(baseline)))
+        restore_imported_prices(db,state)
+        reconciliation=reconcile(baseline,retained,broker,state,account.balance,new_baseline)
+        latest=max(retained,key=lambda d:(d['time'],d['ticket']),default=None)
+        result={'brokerId':broker_id,'status':'success','message':f'Sinkronisasi selesai: {len(deals)} deal diperiksa, {added} baru, {updated} diperbarui.', 'time':now.isoformat(), 'deals':len(deals),'new':added,'updated':updated,'latestTicket':str(latest['ticket']) if latest else None,'reconciliation':reconciliation}
+        config['lastSync']=result['time'];config['lastMessage']=result['message']
+        if str(state['settings'].get('brokerId'))==str(broker['id']): state['settings']=dict(config)
+        state['syncRevision']=state.get('syncRevision',0)+1
+        save(db,state)
+        db.execute('INSERT INTO sync_runs(time,result) VALUES(?,?)',(result['time'],json.dumps(result)))
+        return result
 
 def write_note(db,data):
     title=str(data.get('title','')).strip();body=str(data.get('body',''))
@@ -284,12 +405,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers();self.wfile.write(body)
     def auth_gate(self,method):
         from user_auth import current_user,endpoint_permission,require
-        with LOCK,connect() as db:self.user=current_user(db,self.headers.get('Cookie'))
+        with readonly() as db:self.user=current_user(db,self.headers.get('Cookie'))
         permission=endpoint_permission(self.path,method)
         try:
             if not self.user:raise PermissionError('Silakan login terlebih dahulu.')
             if permission:require(self.user,permission)
             if permission=='ai.use':require(self.user,'data.view')
+            audit_trail.context.actor=self.user
             return True
         except PermissionError as e:
             self.reply(401 if not self.user else 403,{'error':str(e)});return False
@@ -300,6 +422,7 @@ class Handler(BaseHTTPRequestHandler):
         data=json.loads(self.rfile.read(length));status=200;session_cookie=None
         with LOCK,connect() as db:
             user=current_user(db,self.headers.get('Cookie'))
+            audit_trail.context.actor=user or {'username':str(data.get('username','anonymous'))[:100]}
             if self.path=='/api/auth/setup':
                 user=create_user(db,data,first=True);session_cookie=cookie(session(db,user['id']));result={'user':user}
             elif self.path=='/api/auth/login':
@@ -323,60 +446,143 @@ class Handler(BaseHTTPRequestHandler):
                     if (target and target['role']=='Administrator') or role=='Administrator' or (rights and not set(json.loads(rights[0])).issubset(user['permissions'])):
                         raise PermissionError('Tidak boleh memberikan atau mengubah akses yang melebihi hak akses Anda.')
                 result={'user':update_user(db,user,data) if data.get('id') else create_user(db,data)}
+            elif self.path=='/api/admin/account-owner':
+                require(user,'users.manage')
+                if user['role']!='Administrator':raise PermissionError('Hanya Administrator dapat memindahkan kepemilikan akun.')
+                broker_id=str(data.get('brokerId'));owner_id=int(data.get('userId'))
+                if not any(str(b['id'])==broker_id for b in (load(db) or {}).get('brokers',[])):raise ValueError('Akun tidak ditemukan.')
+                if not db.execute('SELECT 1 FROM app_users WHERE id=? AND active=1',(owner_id,)).fetchone():raise ValueError('Pengguna aktif tidak ditemukan.')
+                db.execute('INSERT INTO broker_owners VALUES(?,?) ON CONFLICT(broker_id) DO UPDATE SET user_id=excluded.user_id',(broker_id,owner_id))
+                result={'saved':True}
             elif self.path=='/api/admin/roles':
                 require(user,'roles.manage')
                 if user['role']!='Administrator' and not set(data.get('permissions',[])).issubset(user['permissions']):raise PermissionError('Tidak boleh memberikan hak akses yang tidak Anda miliki.')
                 save_role(db,data);result={'saved':True}
             else:raise ValueError('Endpoint tidak ditemukan.')
+            audit_trail.event(db,'login_success' if self.path.endswith('/login') and user else 'login_failed' if self.path.endswith('/login') else 'auth_action','authentication',self.path,None,{'status':status,'passwordChanged':bool(data.get('password')) and not self.path.endswith('/login')})
         self.reply(status,result,session_cookie)
     def do_GET(self):
         if self.path=='/api/auth/status':
             from user_auth import current_user
-            with LOCK,connect() as db:result={'setupRequired':not db.execute('SELECT 1 FROM app_users LIMIT 1').fetchone(),'user':current_user(db,self.headers.get('Cookie'))}
+            with readonly() as db:result={'setupRequired':not db.execute('SELECT 1 FROM app_users LIMIT 1').fetchone(),'user':current_user(db,self.headers.get('Cookie'))}
             return self.reply(200,result)
         if self.path.startswith('/api/') and not self.auth_gate('GET'):return
+        if self.path=='/api/sync/status':
+            # WAL read without the MT5 lock, so a running attempt remains observable.
+            with readonly() as db:
+                state=account_access.broker_view(db,self.user);statuses={id:json.loads(data) for id,data in db.execute('SELECT broker_id,data FROM sync_status')}
+            return self.reply(200,[dict(statuses.get(str(b['id']),{'status':'unknown','message':'Belum ada percobaan setelah pembaruan.'}),brokerId=str(b['id']),accountName=b['name'],timeConfirmed=bool(b.get('integration',{}).get('timeConfirmed',False))) for b in state.get('brokers',[])])
         if self.path in ('/api/admin/users','/api/admin/roles'):
             from user_auth import public_user,PERMISSIONS
-            with LOCK,connect() as db:
-                roles=[{'name':name,'permissions':json.loads(p)} for name,p in db.execute('SELECT name,permissions FROM app_roles ORDER BY name')]
+            with readonly() as db:
+                roles=[{'name':name,'permissions':list(PERMISSIONS) if name=='Administrator' else json.loads(p)} for name,p in db.execute('SELECT name,permissions FROM app_roles ORDER BY name')]
                 result={'roles':roles,'permissions':PERMISSIONS}
-                if self.path.endswith('/users'):result['users']=[public_user(db,id) for id, in db.execute('SELECT id FROM app_users ORDER BY id')]
+                if self.path.endswith('/users'):
+                    result['users']=[public_user(db,id) for id, in db.execute('SELECT id FROM app_users ORDER BY id')]
+                    if self.user['role']=='Administrator':
+                        owners=dict(db.execute('SELECT broker_id,user_id FROM broker_owners'))
+                        result['accounts']=[{'id':b['id'],'name':b['name'],'userId':owners.get(str(b['id']))} for b in (load(db) or {}).get('brokers',[])]
             return self.reply(200,result)
-        if self.path=='/api/ai/settings':
+        if self.path=='/api/preferences':
+            from app_preferences import read
+            with readonly() as db:self.reply(200,read(db,self.user['id']))
+        elif self.path=='/api/strategies':
+            from strategies import listing
+            with readonly() as db:self.reply(200,listing(db,account_access.view(db,load(db),self.user)))
+        elif self.path=='/api/ai/settings':
             from ai_notes import key_status
             self.reply(200,key_status())
         elif self.path=='/api/notes':
-            with connect() as db:
-                self.reply(200,[dict(json.loads(data),id=id,revision=rev) for id,data,rev in db.execute('SELECT id,data,revision FROM daily_notes ORDER BY id DESC')])
+            with readonly() as db:
+                self.reply(200,[dict(json.loads(data),id=id,revision=rev) for id,data,rev in db.execute('SELECT id,data,revision FROM daily_notes ORDER BY id DESC') if account_access.note_visible(db,json.loads(data),self.user)])
         elif self.path=='/api/state':
-            with LOCK, connect() as db: self.reply(200,load(db))
+            with readonly() as db: self.reply(200,account_access.view(db,load(db),self.user))
         elif self.path in ('/','/index.html'):
             self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write((ROOT/'mockup/index.html').read_bytes())
         elif self.path=='/vendor/lightweight-charts.js':
             self.send_response(200);self.send_header('Content-Type','application/javascript');self.end_headers();self.wfile.write((ROOT/'mockup/vendor/lightweight-charts.js').read_bytes())
-        elif self.path in ('/performance.js','/table-pagination.js','/table-sorting.js','/notes.js','/note-ai.js','/note-ai-main.js','/ai-settings.js','/trader-ui.js','/live-chart-ui.js','/ai-logs-ui.js','/users-ui.js'):
+        elif self.path in ('/indicators-library.js','/app-ui.js','/performance.js','/table-pagination.js','/table-sorting.js','/notes.js','/note-ai.js','/note-ai-main.js','/ai-settings.js','/trader-ui.js','/live-chart-ui.js','/ai-logs-ui.js','/users-ui.js','/sync-health-ui.js','/strategies-ui.js','/app-time.js','/admin-data-ui.js','/attachments.js'):
             self.send_response(200);self.send_header('Content-Type','application/javascript; charset=utf-8');self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write((ROOT/'mockup'/self.path.lstrip('/')).read_bytes())
         else: self.reply(404,{'error':'Not found'})
     def do_POST(self):
+        global RESTORE_GENERATION
+        audit_trail.context.generation=RESTORE_GENERATION
+        audit_trail.context.actor=None
         if self.headers.get('Origin') not in ('http://127.0.0.1:3000','http://localhost:3000'):
             return self.reply(403,{'error':'Origin tidak diizinkan'})
         try:
-            if self.path.startswith('/api/auth/') or self.path in ('/api/admin/users','/api/admin/roles'):
+            if self.path.startswith('/api/auth/') or self.path in ('/api/admin/users','/api/admin/roles','/api/admin/account-owner'):
                 return self.auth_post()
             if not self.auth_gate('POST'):return
-            if self.path=='/api/logs/context':
+            if self.path=='/api/attachments':
+                import attachments
+                length=int(self.headers.get('Content-Length','0'))
+                if length<0 or length>7*1024*1024:raise ValueError('Gambar maksimal 5 MB.')
+                data=json.loads(self.rfile.read(length))
+                with LOCK,connect() as db:result=attachments.operate(db,account_access.view(db,load(db),self.user) or {},data,self.user)
+                return self.reply(200,result)
+            if self.path.startswith('/api/admin/backup/') or self.path=='/api/admin/audit':
+                import backup_restore
+                length=int(self.headers.get('Content-Length','0'))
+                if self.path.endswith('/upload'):
+                    if length>backup_restore.MAX_SIZE:raise ValueError('Ukuran cadangan maksimal 64 MB.')
+                    data=self.rfile.read(length)
+                else:
+                    if length>16000:raise ValueError('Input terlalu besar.')
+                    data=json.loads(self.rfile.read(length) or b'{}')
+                with LOCK:
+                    if self.path=='/api/admin/audit':
+                        with connect() as db:result=audit_trail.listing(db,data)
+                    elif self.path.endswith('/list'):result={'backups':backup_restore.listing(DB)}
+                    elif self.path.endswith('/create'):
+                        result=backup_restore.create(DB)
+                        with connect() as db:audit_trail.event(db,'backup_created','backup',result['name'],None,{'sha256':result['sha256']})
+                    elif self.path.endswith('/upload'):
+                        result=backup_restore.upload(DB,data)
+                        with connect() as db:audit_trail.event(db,'backup_uploaded','backup',result['name'],None,{'sha256':result['sha256']})
+                    elif self.path.endswith('/preview'):result=backup_restore.inspect(backup_restore.path_for(DB,data.get('name')),DB)
+                    elif self.path.endswith('/download'):
+                        path=backup_restore.path_for(DB,data.get('name'));content=path.read_bytes()
+                        with connect() as db:audit_trail.event(db,'backup_downloaded','backup',path.name)
+                        self.send_response(200);self.send_header('Content-Type','application/vnd.sqlite3');self.send_header('Content-Disposition','attachment; filename="'+path.name+'"');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(content)));self.end_headers();self.wfile.write(content);return
+                    elif self.path.endswith('/restore'):
+                        try:result=backup_restore.restore(DB,connect,data)
+                        except Exception as error:
+                            with connect() as db:audit_trail.event(db,'restore_failed','backup',str(data.get('name',''))[:150],None,{'error':str(error)})
+                            raise
+                        RESTORE_GENERATION+=1;audit_trail.context.generation=RESTORE_GENERATION
+                    else:raise ValueError('Endpoint cadangan tidak ditemukan.')
+                self.reply(200,result)
+            elif self.path=='/api/preferences':
+                from app_preferences import write
+                length=int(self.headers.get('Content-Length','0'))
+                if length>15000:raise ValueError('Pengaturan terlalu besar.')
+                data=json.loads(self.rfile.read(length))
+                with LOCK,connect() as db:
+                    for broker_id in data.get('brokerOffsets',{}):account_access.require_broker(db,self.user,broker_id)
+                    result=write(db,data,self.user['id'])
+                self.reply(200,result)
+            elif self.path=='/api/strategies':
+                from strategies import write
+                length=int(self.headers.get('Content-Length','0'))
+                if length>50000:raise ValueError('Input strategi terlalu besar.')
+                data=json.loads(self.rfile.read(length))
+                with LOCK,connect() as db:result=write(db,data,load(db))
+                self.reply(200,result)
+            elif self.path=='/api/logs/context':
                 from ai_log_context import retrieve_logs
                 length=int(self.headers.get('Content-Length','0'))
                 if length>15000:raise ValueError('Filter terlalu besar.')
                 data=json.loads(self.rfile.read(length))
-                with LOCK,connect() as db: result=retrieve_logs(load(db) or {},data)
+                with LOCK,connect() as db: result=retrieve_logs(account_access.view(db,load(db),self.user) or {},data)
                 self.reply(200,result)
             elif self.path=='/api/chart':
                 from live_chart import read_live_chart
                 length=int(self.headers.get('Content-Length','0'))
                 if length>4000:raise ValueError('Input chart terlalu besar.')
                 data=json.loads(self.rfile.read(length))
-                with LOCK,connect() as db: result=read_live_chart(load(db),data)
+                with readonly() as db:state=account_access.view(db,load(db),self.user)
+                with MT5_LOCK:result=read_live_chart(state,data)
                 self.reply(200,result)
             elif self.path in ('/api/trader/history','/api/trader/context','/api/trader/chat','/api/trader/clear'):
                 from trader_ai import market_context,answer_trader,chat_history
@@ -386,16 +592,18 @@ class Handler(BaseHTTPRequestHandler):
                 from user_auth import require
                 if data.get('includeMarket'):require(self.user,'market.view')
                 with LOCK,connect() as db:
-                    state=load(db)
+                    state=account_access.view(db,load(db),self.user)
                     if not any(str(b['id'])==broker_id for b in state['brokers']):raise ValueError('Akun trading tidak ditemukan.')
                     if self.path=='/api/trader/clear':
+                        count=db.execute('SELECT COUNT(*) FROM trader_messages WHERE broker_id=?',(broker_id,)).fetchone()[0]
                         db.execute('DELETE FROM trader_messages WHERE broker_id=?',(broker_id,))
+                        audit_trail.event(db,'clear','trader_messages',broker_id,{'count':count},None)
                         return self.reply(200,{'cleared':True})
                     history=chat_history(db,broker_id)
                 if self.path=='/api/trader/history':return self.reply(200,history)
                 context=None
                 if self.path=='/api/trader/context' or data.get('includeMarket'):
-                    with LOCK:context=market_context(state,data)
+                    with MT5_LOCK:context=market_context(state,data)
                 if self.path=='/api/trader/context':return self.reply(200,context)
                 message=str(data.get('message','')).strip()
                 if not message or len(message)>5000:raise ValueError('Pesan wajib diisi, maksimal 5.000 karakter.')
@@ -415,7 +623,10 @@ class Handler(BaseHTTPRequestHandler):
                 length=int(self.headers.get('Content-Length','0'))
                 if length>4000:raise ValueError('Input terlalu besar.')
                 data=json.loads(self.rfile.read(length))
-                self.reply(200,configure_ai(data))
+                with LOCK,connect() as db:
+                    result=configure_ai(data)
+                    audit_trail.event(db,'configure','ai_settings','server',None,{'platform':result['platform'],'url':result['url'],'model':result['model'],'configured':result['configured'],'keyChanged':bool(data.get('apiKey') or data.get('deleteKey'))})
+                self.reply(200,result)
             elif self.path=='/api/notes/ai':
                 from ai_notes import draft_note
                 length=int(self.headers.get('Content-Length','0'))
@@ -423,21 +634,31 @@ class Handler(BaseHTTPRequestHandler):
                 data=json.loads(self.rfile.read(length))
                 from user_auth import require
                 require(self.user,'notes.edit')
-                with LOCK, connect() as db: state=load(db)
+                with LOCK, connect() as db: state=account_access.view(db,load(db),self.user)
                 self.reply(200,draft_note(data,state or {'records':[],'brokers':[]}))
             elif self.path=='/api/notes':
                 length=int(self.headers.get('Content-Length','0'))
                 if length>100000: raise ValueError('Catatan terlalu panjang.')
                 data=json.loads(self.rfile.read(length))
                 with LOCK, connect() as db:
-                    self.reply(200,write_note(db,data))
+                    if data.get('brokerId') is not None:account_access.require_broker(db,self.user,data['brokerId'])
+                    if data.get('id'):
+                        old=db.execute('SELECT data FROM daily_notes WHERE id=?',(data['id'],)).fetchone()
+                        if not old or not account_access.note_visible(db,json.loads(old[0]),self.user):raise PermissionError('Catatan bukan milik pengguna ini.')
+                    result=write_note(db,data)
+                    result['ownerUserId']=self.user['id']
+                    stored={k:v for k,v in result.items() if k not in ('id','revision')}
+                    db.execute('UPDATE daily_notes SET data=? WHERE id=?',(json.dumps(stored),result['id']))
+                    self.reply(200,result)
             elif self.path=='/api/state':
                 length=int(self.headers.get('Content-Length','0'))
                 if length>5000000: raise ValueError('Data terlalu besar')
                 data=json.loads(self.rfile.read(length))
                 if not all(isinstance(data.get(k),list) for k in ('records','brokers','funds')): raise ValueError('Format state tidak valid')
                 with LOCK, connect() as db:
-                    current=load(db)
+                    full=load(db) or {'brokers':[],'records':[],'funds':[],'settings':{}}
+                    current=account_access.view(db,full,self.user)
+                    account_access.validate_payload(db,self.user,data,current)
                     base=data.pop('_base',None)
                     if current and base:
                         data=merge_manual_edits(current,data,base)
@@ -456,18 +677,21 @@ class Handler(BaseHTTPRequestHandler):
                     if current:
                         from user_auth import require
                         if current['records']!=data['records'] or current['funds']!=data['funds']:require(self.user,'logs.edit')
-                        if current['brokers']!=data['brokers'] or current['settings']!=data['settings']:require(self.user,'settings.manage')
+                        if current['brokers']!=data['brokers'] or current['settings']!=data['settings']:require(self.user,'broker.manage')
                     restore_imported_prices(db,data)
-                    save(db,data)
+                    save(db,account_access.combine(db,full,current,data,self.user))
                 self.reply(200,{'saved':True})
             elif self.path in ('/api/sync','/api/connection'):
-                self.reply(200,synchronize(self.path=='/api/connection'))
+                with readonly() as db:
+                    selected=account_access.view(db,load(db),self.user)['settings'].get('brokerId')
+                    account_access.require_broker(db,self.user,selected)
+                self.reply(200,synchronize(self.path=='/api/connection',broker_id=selected))
             elif self.path=='/api/brokers/register':
                 length=int(self.headers.get('Content-Length','0'))
                 if length>16000: raise ValueError('Konfigurasi terlalu besar')
-                self.reply(200,register_broker(json.loads(self.rfile.read(length))))
+                self.reply(200,register_broker(json.loads(self.rfile.read(length)),self.user))
             elif self.path=='/api/disconnect':
-                self.reply(200,disconnect_active())
+                self.reply(200,disconnect_active(self.user))
             else: self.reply(404,{'error':'Not found'})
         except PermissionError as exc:self.reply(403,{'error':str(exc)})
         except Exception as exc: self.reply(400,{'error':str(exc)})
@@ -482,7 +706,9 @@ def scheduler():
             for broker in (state or {}).get('brokers',[]):
                 settings=broker.get('integration',{})
                 if settings.get('enabled') and settings.get('auto') and time.time()-last.get(broker['id'],0)>=max(60,int(settings.get('interval',60))):
-                    last[broker['id']]=time.time();synchronize(broker_id=broker['id'])
+                    last[broker['id']]=time.time()
+                    try:synchronize(broker_id=broker['id'])
+                    except Exception:pass  # Failure is recorded per account by synchronize().
         except Exception as exc:
             with LOCK, connect() as db:
                 db.execute('INSERT INTO sync_runs(time,result) VALUES(?,?)',(datetime.now(timezone.utc).isoformat(),json.dumps({'error':str(exc)})))

@@ -1,0 +1,6 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),ctx={};vm.createContext(ctx);vm.runInContext(fs.readFileSync(__dirname+'/live-chart-ui.js','utf8'),ctx);
+const positions=[{ticket:'123',side:'Buy',volume:.01,entry:2000,sl:1990,tp:2020},{ticket:'124',side:'Sell',volume:.02,entry:2005,sl:0,tp:0}],colors={gain:'#008800',loss:'#cc0000'};
+const lines=ctx.livePositionLines(positions,colors);assert.equal(lines.length,4);assert.ok(lines.some(l=>l.title.startsWith('SL #123')&&l.price===1990&&l.color===colors.loss));assert.ok(lines.some(l=>l.title.startsWith('TP #123')&&l.price===2020&&l.color===colors.gain));assert.equal(lines.filter(l=>l.title.includes('#124')).length,1);
+assert.equal(ctx.livePositionLines([{entry:NaN,sl:-1,tp:Infinity}],colors).length,0);
+const range={priceRange:{minValue:1998,maxValue:2010},margins:{above:10,below:10}};const result=ctx.livePositionAutoscale(range,positions);assert.equal(result.priceRange.minValue,1990);assert.equal(result.priceRange.maxValue,2020);assert.equal(result.margins.above,10);assert.equal(range.priceRange.minValue,1998);assert.equal(ctx.livePositionAutoscale(null,positions),null);assert.equal(ctx.livePositionAutoscale(range,[]),range);
+console.log('PASS: entry/TP/SL per ticket, unset and invalid levels excluded, autoscale includes risk levels');

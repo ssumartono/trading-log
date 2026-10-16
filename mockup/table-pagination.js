@@ -5,7 +5,7 @@ function paginate(){
   scheduled=false;
   const tables=[...document.querySelectorAll('#content table')];
   tables.forEach((table,index)=>{
-    if(attached.has(table)||table.classList.contains('perf-heat')||table.closest('#perflogs'))return;
+    if(attached.has(table)||table.classList.contains('perf-heat')||table.closest('#perflogs')||table.closest('.trader-text')||table.closest('#auditrows'))return;
     const rows=[...table.tBodies].flatMap(body=>[...body.rows]),defaultSize=window.matchMedia('(max-width:650px)').matches?5:10;
     if(rows.length<=defaultSize)return;
     attached.add(table);

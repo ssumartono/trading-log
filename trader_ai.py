@@ -6,6 +6,7 @@ from urllib.error import HTTPError,URLError
 import ai_notes
 
 def market_context(state,data):
+    from time_rules import utc_timestamp
     import MetaTrader5 as mt5
     broker=next((b for b in state['brokers'] if str(b['id'])==str(data.get('brokerId'))),None)
     if not broker:raise ValueError('Pilih akun trading terlebih dahulu.')
@@ -28,9 +29,9 @@ def market_context(state,data):
         if tick is None or tick.time<=0:raise ValueError('Harga terakhir simbol belum tersedia.')
         if positions is None:raise ValueError('Posisi akun tidak dapat dibaca.')
         if rates is None or len(rates)<2:raise ValueError('Riwayat candle belum cukup. Buka chart simbol pada MT5 lalu coba lagi.')
-        candles=[{'time':int(r['time']),'open':float(r['open']),'high':float(r['high']),'low':float(r['low']),'close':float(r['close']),'tickVolume':int(r['tick_volume'])} for r in rates]
-        age=(datetime.now(timezone.utc).timestamp()-tick.time)
-        return {'fetchedAt':datetime.now(timezone.utc).isoformat(),'symbol':symbol,'timeframe':frame,'tickTime':int(tick.time),'tickAgeSeconds':round(age),'timestampNote':'Timestamp mentah terminal MT5; offset waktu broker dapat berbeda. Periksa waktu pada terminal.','bid':tick.bid,'ask':tick.ask,'spread':round(tick.ask-tick.bid,info.digits),'currency':account.currency,
+        candles=[{'time':utc_timestamp(r['time'],config),'open':float(r['open']),'high':float(r['high']),'low':float(r['low']),'close':float(r['close']),'tickVolume':int(r['tick_volume'])} for r in rates]
+        age=(datetime.now(timezone.utc).timestamp()-utc_timestamp(tick.time,config))
+        return {'fetchedAt':datetime.now(timezone.utc).isoformat(),'symbol':symbol,'timeframe':frame,'tickTime':utc_timestamp(tick.time,config),'tickAgeSeconds':round(age),'timestampNote':'Waktu dinormalisasi dari konfigurasi broker. Tampilkan WIB.' if config.get('timeConfirmed') else 'Basis waktu broker belum dikonfirmasi; sementara diasumsikan UTC.','bid':tick.bid,'ask':tick.ask,'spread':round(tick.ask-tick.bid,info.digits),'currency':account.currency,
                 'account':{'balance':account.balance,'equity':account.equity,'floatingProfit':account.profit,'freeMargin':account.margin_free},
                 'openPositions':[{'symbol':p.symbol,'side':'Buy' if p.type==0 else 'Sell','volume':p.volume,'entry':p.price_open,'currentPrice':p.price_current,'sl':p.sl,'tp':p.tp,'floatingProfit':p.profit} for p in positions],
                 'closedCandles':candles,'summary':{'changePercent':round((candles[-1]['close']/candles[0]['close']-1)*100,3) if candles[0]['close'] else None,'high':max(c['high'] for c in candles),'low':min(c['low'] for c in candles),'candleCount':len(candles)},

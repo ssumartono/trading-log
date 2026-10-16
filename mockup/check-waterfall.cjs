@@ -1,0 +1,8 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');const h=fs.readFileSync(__dirname+'/index.html','utf8'),ctx={};vm.createContext(ctx);vm.runInContext(h.slice(h.indexOf('function historyCutoff('),h.indexOf('function growthChart(')),ctx);
+const b={id:1,name:'A',initial:100},trades=[{broker:'A',date:'2026-01-02',profit:20},{broker:'A',date:'2026-02-02',profit:-10},{broker:'B',date:'2026-02-02',profit:999}],funds=[{brokerId:1,date:'2026-01-01',type:'Deposit',amount:50},{brokerId:1,date:'2026-02-01',type:'Withdraw',amount:5},{brokerId:1,date:'2026-02-03',type:'Adjustment',amount:2,signedAmount:-2}];
+let s=ctx.waterfallSteps(b,trades,funds,'all');assert.equal(s.at(-1).end,153);for(let i=1;i<s.length-1;i++)assert.equal(s[i].start,s[i-1].end);
+s=ctx.waterfallSteps(b,trades,funds,'30',new Date('2026-03-01T12:00:00Z'));assert.equal(s[0].end,170);assert.equal(s.at(-1).end,153);console.log('PASS: waterfall totals, connectors, selected period opening balance, account isolation');
+const now=new Date('2026-10-13T18:00:00Z');assert.equal(ctx.historyCutoff('today',now),'2026-10-14');assert.equal(ctx.historyCutoff('7',now),'2026-10-08');
+const shortRows=[{broker:'A',date:'2026-10-07',profit:10},{broker:'A',date:'2026-10-08',profit:20},{broker:'A',date:'2026-10-14',profit:-5}];
+s=ctx.waterfallSteps(b,shortRows,[],'7',now);assert.equal(s[0].end,110);assert.equal(s.at(-1).end,125);
+s=ctx.waterfallSteps(b,shortRows,[],'today',now);assert.equal(s[0].end,130);assert.equal(s.at(-1).end,125);console.log('PASS: 7-day inclusive range, today WIB, opening balances');
