@@ -1,0 +1,96 @@
+//@version=6
+indicator("EMA 9 / SMA 20 - Signals + Profit Protection", overlay=true)
+
+int fastLength = input.int(9, "Periode EMA", minval=1)
+int slowLength = input.int(20, "Periode SMA", minval=1)
+bool showLines = input.bool(true, "Tampilkan EMA/SMA")
+int slTicks = input.int(300, "SL awal (ticks)", minval=1)
+float activationR = input.float(1.0, "Aktifkan proteksi saat profit (R)", minval=0.1, step=0.1)
+int costTicks = input.int(0, "Buffer biaya pada breakeven (ticks)", minval=0)
+int swingBars = input.int(2, "Konfirmasi swing kiri/kanan", minval=1)
+
+float fastEMA = ta.ema(close, fastLength)
+float slowSMA = ta.sma(close, slowLength)
+bool crossUp = ta.crossover(fastEMA, slowSMA)
+bool crossDown = ta.crossunder(fastEMA, slowSMA)
+float pivotLow = ta.pivotlow(low, swingBars, swingBars)
+float pivotHigh = ta.pivothigh(high, swingBars, swingBars)
+float riskDistance = slTicks * syminfo.mintick
+float costBuffer = costTicks * syminfo.mintick
+
+// Virtual signal state only: no orders, broker positions or actual fills.
+var int position = 0
+var float entryPrice = na
+var float stopPrice = na
+var int entryBar = na
+var bool protectionActive = false
+bool buySignal = false
+bool sellSignal = false
+bool exitBuy = false
+bool exitSell = false
+bool protectionSignal = false
+
+if barstate.isconfirmed
+    // Test the stop carried from the previous bar against this bar's CLOSE.
+    // No claim of an intrabar stop fill is made.
+    if position == 1 and (crossDown or close <= stopPrice)
+        exitBuy := true
+        position := 0
+    else if position == -1 and (crossUp or close >= stopPrice)
+        exitSell := true
+        position := 0
+
+    // A fresh cross can reverse direction. A trailing exit alone cannot re-enter.
+    if crossUp and position != 1
+        position := 1
+        entryPrice := close
+        stopPrice := close - riskDistance
+        entryBar := bar_index
+        protectionActive := false
+        buySignal := true
+    else if crossDown and position != -1
+        position := -1
+        entryPrice := close
+        stopPrice := close + riskDistance
+        entryBar := bar_index
+        protectionActive := false
+        sellSignal := true
+
+    if position != 0
+        float profitDistance = position == 1 ? close - entryPrice : entryPrice - close
+        float breakEven = entryPrice + position * costBuffer
+        // The proposed stop must remain on the protective side of current price.
+        bool canProtect = position == 1 ? close > breakEven : close < breakEven
+        if not protectionActive and profitDistance >= activationR * riskDistance and canProtect
+            protectionActive := true
+            protectionSignal := true
+            stopPrice := position == 1 ? math.max(stopPrice, breakEven) : math.min(stopPrice, breakEven)
+
+        // Only use confirmed pivots whose pivot candle is after entry.
+        // New stops become eligible for exit checks on the NEXT closed candle.
+        if protectionActive and bar_index - swingBars > entryBar
+            if position == 1 and not na(pivotLow) and pivotLow < close
+                stopPrice := math.max(stopPrice, pivotLow)
+            else if position == -1 and not na(pivotHigh) and pivotHigh > close
+                stopPrice := math.min(stopPrice, pivotHigh)
+    else
+        entryPrice := na
+        stopPrice := na
+        entryBar := na
+        protectionActive := false
+
+plot(showLines ? fastEMA : na, "EMA", color=color.blue, linewidth=2)
+plot(showLines ? slowSMA : na, "SMA", color=color.white, linewidth=2)
+plot(position != 0 ? entryPrice : na, "Entry referensi", color=color.new(color.gray, 40), style=plot.style_linebr)
+plot(position != 0 ? stopPrice : na, "SL / Trailing (aktif candle berikut)", color=protectionActive ? color.orange : color.red, linewidth=2, style=plot.style_linebr)
+
+plotshape(buySignal, title="BUY", style=shape.labelup, location=location.belowbar, color=color.green, text="BUY", textcolor=color.white, size=size.small)
+plotshape(sellSignal, title="SELL", style=shape.labeldown, location=location.abovebar, color=color.red, text="SELL", textcolor=color.white, size=size.small)
+plotshape(exitBuy, title="EXIT BUY", style=shape.labeldown, location=location.abovebar, color=color.orange, text="EXIT BUY", textcolor=color.black, size=size.tiny)
+plotshape(exitSell, title="EXIT SELL", style=shape.labelup, location=location.belowbar, color=color.orange, text="EXIT SELL", textcolor=color.black, size=size.tiny)
+
+alertcondition(buySignal, "BUY", "BUY | {{ticker}} | {{interval}} | Close {{close}}")
+alertcondition(sellSignal, "SELL", "SELL | {{ticker}} | {{interval}} | Close {{close}}")
+alertcondition(exitBuy, "EXIT BUY", "EXIT BUY: crossover berlawanan atau close melewati stop | {{ticker}} | {{interval}}")
+alertcondition(exitSell, "EXIT SELL", "EXIT SELL: crossover berlawanan atau close melewati stop | {{ticker}} | {{interval}}")
+alertcondition(protectionSignal, "PROTEKSI AKTIF", "Proteksi breakeven + swing aktif | {{ticker}} | {{interval}}")

@@ -1,0 +1,80 @@
+const {test}=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs');
+const {chromium}=require('C:/Users/62811/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+test('embedded AI follows loaded chart, preserves history during polls and identifies old results',async()=>{
+ const browser=await chromium.launch({channel:'msedge',headless:true});
+ try{
+ const page=await browser.newPage({viewport:{width:1400,height:1000}}),errors=[],requests=[];let hold=null;
+ page.on('pageerror',e=>errors.push(e.message));
+ const ctx=(symbol='EURUSD',timeframe='M15')=>({symbol,timeframe,fetchedAt:'2026-10-16T10:00:00Z',bid:1.1,ask:1.2,spread:.1,summary:{candleCount:60,changePercent:1,high:2,low:1},account:{balance:1000,equity:1000,floatingProfit:0},openPositions:[],timestampNote:'UTC'});
+ await page.route('http://test/**',async route=>{
+  const path=new URL(route.request().url()).pathname,data=route.request().postDataJSON()||{};requests.push({path,data});
+  let result={};
+  if(path==='/api/trader/history')result=[];
+  if(path==='/api/chart')result={symbol:data.symbol||'EURUSD',timeframe:data.timeframe,digits:5,point:.00001,symbols:['EURUSD','XAUUSD'],bid:1.1,ask:1.2,spread:.1,fetchedAt:'2026-10-16T10:00:00Z',tickTime:1792144800,tickAgeSeconds:0,timeConfirmed:true,account:{balance:1000,equity:1000,currency:'USD',floatingProfit:0},positions:[],candles:Array.from({length:100},(_,i)=>({time:1792100000+i*900,open:1.1,high:1.2,low:1,close:1.15}))};
+  if(path==='/api/trader/chat'){if(hold)await hold;result={answer:'**Fakta chart**: uji analisis',chartContext:data.includeLiveChart?{...ctx(data.symbol,data.timeframe),sourceType:'liveChart'}:null,context:data.includeMarket?ctx(data.symbol,data.timeframe):null,sources:{liveChart:!!data.includeLiveChart,logs:!!data.includeLogs,snapshot:!!data.includeMarket,screenshot:!!data.screenshot},userCreatedAt:'2026-10-16T10:00:00Z',assistantCreatedAt:'2026-10-16T10:00:05Z'};}
+  await route.fulfill({json:result});
+ });
+ await page.goto('http://test/');
+ const css=fs.readFileSync('mockup/index.html','utf8').match(/<style>([\s\S]*?)<\/style>/)[1];
+ await page.setContent('<style>'+css+'</style><div id="pagetitle" data-page-title="Live Chart"></div><div class="shell"><aside><button data-page="livechart" class="active">Live Chart</button></aside><main><div id="content"></div></main><section id="detail" class="detail"></section></div>');
+ await page.addScriptTag({content:`window.currentUser={id:1};window.userCan=()=>true;window.setPageHeader=()=>{};window.readIndicatorSelection=()=>[];window.appTimeLabel=()=> 'UTC';window.appFormatTime=v=>String(v);window.mountAttachments=parent=>{const s=document.createElement('section');s.innerHTML='<div data-gallery>lampiran</div>';parent.append(s);return {}};window.attachAILogs=()=>({read:()=>({includeLogs:false}),display:()=>{}});`});
+ for(const file of ['mockup/app-ui.js','mockup/vendor/lightweight-charts.js','mockup/trader-ui.js','mockup/live-chart-ui.js'])await page.addScriptTag({content:fs.readFileSync(file,'utf8')});
+ const nav=page.locator('#navigation-toggle');await nav.click();
+ assert.equal(await nav.getAttribute('aria-expanded'),'false');
+ assert.equal(await page.evaluate(()=>Math.round(document.querySelector('.shell>aside').getBoundingClientRect().width)),72);
+ assert.equal(await page.evaluate(()=>localStorage.getItem('tradinglog-navigation-collapsed')),'true');
+ await nav.click();assert.equal(await nav.getAttribute('aria-expanded'),'true');
+ await page.evaluate(()=>renderLiveChart(document.querySelector('#content'),document.querySelector('#detail'),{id:1,name:'Demo'}));
+ await page.waitForFunction(()=>document.querySelector('#lcquote').textContent.includes('EURUSD · M15'));
+ assert.equal(requests.filter(r=>r.path==='/api/trader/chat').length,0);
+ assert.equal(await page.locator('#traderlive').isChecked(),true);
+ await page.locator('#traderpreset').selectOption('market');
+ assert.match(await page.locator('#tradermessage').inputValue(),/Analisis kondisi/);
+ await page.locator('#tradermarket').check();
+ await page.locator('#traderscreen').check();await page.locator('#tradercapture').click();
+ assert.match(await page.locator('#traderpreview').getAttribute('src'),/^data:image\/png;base64,/);
+ assert.equal(requests.filter(r=>r.path==='/api/trader/chat').length,0);
+ await page.locator('#traderscreen').uncheck();
+ await page.locator('#tradermessage').fill('Analisis chart');await page.locator('#tradersend').click();
+ await page.waitForSelector('.trader-text strong');
+ assert.equal(await page.locator('.trader-message-time').count(),2);
+ assert.equal(await page.locator('.trader-message-time').first().getAttribute('datetime'),'2026-10-16T10:00:00.000Z');
+ assert.equal(await page.locator('.trader-message-time').last().getAttribute('datetime'),'2026-10-16T10:00:05.000Z');
+ assert.equal(requests.find(r=>r.path==='/api/trader/chat').data.symbol,'EURUSD');
+ assert.equal(requests.find(r=>r.path==='/api/trader/chat').data.includeMarket,true);
+ assert.equal(requests.find(r=>r.path==='/api/trader/chat').data.includeLiveChart,true);
+ await page.locator('#lcframe').selectOption('M1');
+ await page.locator('#tradermessage').fill('Jangan kirim sebelum chart dimuat');await page.locator('#tradersend').click();
+ assert.match(await page.locator('#traderstatus').textContent(),/Tampilkan chart/);
+ assert.equal(requests.filter(r=>r.path==='/api/trader/chat').length,1);
+ await page.locator('#lcload').click();await page.waitForFunction(()=>document.querySelector('#lcquote').textContent.includes('EURUSD · M1   Bid'));
+ assert.match(await page.locator('.trader-chart-relation').textContent(),/berbeda/);
+ assert.equal(await page.locator('.trader-bubble').count(),2);
+ await page.getByRole('button',{name:'Tampilkan EURUSD · M15 di chart'}).click();
+ await page.waitForFunction(()=>document.querySelector('#lcquote').textContent.includes('EURUSD · M15'));
+ assert.match(await page.locator('.trader-chart-relation').textContent(),/chart aktif/);
+ for(const width of [1400,390]){await page.setViewportSize({width,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);await page.screenshot({path:'mockup/live-assistant-'+width+'.png',fullPage:true});}
+ // A response for an earlier chart must retain its original context.
+ let release;hold=new Promise(resolve=>release=resolve);
+ await page.locator('#tradermessage').fill('Analisis tertunda');await page.locator('#tradersend').click();
+ await page.waitForFunction(()=>document.querySelector('#tradersend').disabled);
+ await page.locator('#lcframe').selectOption('M1');await page.locator('#lcload').click();
+ await page.waitForFunction(()=>document.querySelector('#lcquote').textContent.includes('EURUSD · M1   Bid'));
+ release();hold=null;await page.waitForFunction(()=>!document.querySelector('#tradersend').disabled);
+ assert.match(await page.locator('.trader-chart-relation').textContent(),/berbeda/);
+ assert.equal(await page.locator('.trader-bubble').count(),4);
+ await page.evaluate(()=>{liveChartCleanup();renderLiveChart(document.querySelector('#content'),document.querySelector('#detail'),{id:2,name:'Akun kedua'})});
+ await page.waitForFunction(()=>document.querySelector('#lcquote').textContent.includes('Bid'));
+ assert.equal(await page.locator('.trader-bubble').count(),0);
+ await page.locator('#traderlive').uncheck();
+ await page.locator('#tradermessage').fill('Pertanyaan umum tanpa sumber');await page.locator('#tradersend').click();
+ await page.waitForFunction(()=>document.querySelectorAll('.trader-bubble').length===2);
+ const plain=requests.filter(r=>r.path==='/api/trader/chat').at(-1).data;
+ assert.equal(plain.includeMarket,false);assert.equal(plain.includeLogs,false);assert.equal(plain.screenshot,null);
+ await page.locator('#traderscreen').check();await page.locator('#tradercapture').click();
+ await page.locator('#tradermessage').fill('Baca gambar chart');await page.locator('#tradersend').click();
+ await page.waitForFunction(()=>document.querySelectorAll('.trader-bubble').length===4);
+ assert.match(requests.filter(r=>r.path==='/api/trader/chat').at(-1).data.screenshot,/^data:image\/png;base64,/);
+ assert.deepEqual(errors,[]);
+ }finally{await browser.close()}
+});

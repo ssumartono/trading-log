@@ -585,12 +585,13 @@ class Handler(BaseHTTPRequestHandler):
                 with MT5_LOCK:result=read_live_chart(state,data)
                 self.reply(200,result)
             elif self.path in ('/api/trader/history','/api/trader/context','/api/trader/chat','/api/trader/clear'):
-                from trader_ai import market_context,answer_trader,chat_history
+                from trader_ai import market_context,answer_trader,chat_history,validate_chart_image
                 length=int(self.headers.get('Content-Length','0'))
-                if length>15000:raise ValueError('Pesan terlalu besar.')
+                if length>(3000000 if self.path=='/api/trader/chat' else 15000):raise ValueError('Pesan terlalu besar.')
                 data=json.loads(self.rfile.read(length));broker_id=str(data.get('brokerId',''))
                 from user_auth import require
-                if data.get('includeMarket'):require(self.user,'market.view')
+                if data.get('includeMarket') or data.get('includeLiveChart') or data.get('screenshot'):require(self.user,'market.view')
+                screenshot=validate_chart_image(data.get('screenshot'))
                 with LOCK,connect() as db:
                     state=account_access.view(db,load(db),self.user)
                     if not any(str(b['id'])==broker_id for b in state['brokers']):raise ValueError('Akun trading tidak ditemukan.')
@@ -605,19 +606,29 @@ class Handler(BaseHTTPRequestHandler):
                 if self.path=='/api/trader/context' or data.get('includeMarket'):
                     with MT5_LOCK:context=market_context(state,data)
                 if self.path=='/api/trader/context':return self.reply(200,context)
+                chart_context=None
+                if data.get('includeLiveChart'):
+                    from live_chart import read_live_chart
+                    with MT5_LOCK:chart_context=read_live_chart(state,data)
+                    chart_context={k:chart_context[k] for k in ('symbol','timeframe','fetchedAt','bid','ask','spread','candles','indicators','positions','timeNote','tickAgeSeconds')}
+                    chart_context['sourceType']='liveChart'
+                    chart_context['summary']={'candleCount':len(chart_context['candles'])}
                 message=str(data.get('message','')).strip()
                 if not message or len(message)>5000:raise ValueError('Pesan wajib diisi, maksimal 5.000 karakter.')
+                user_stamp=datetime.now(timezone.utc).isoformat()
                 messages=[{'role':m['role'],'content':m['content']} for m in history[-20:]]+[{'role':'user','content':message}]
                 log_context=None
                 if data.get('includeLogs'):
                     from ai_log_context import retrieve_logs
                     log_context=retrieve_logs(state,data)
-                answer=answer_trader(messages,context,log_context)
+                sources={'logs':bool(log_context),'snapshot':bool(context),'screenshot':bool(screenshot)}
+                if chart_context:sources['liveChart']=True
+                answer=answer_trader(messages,context,log_context,screenshot,chart_context) if chart_context else answer_trader(messages,context,log_context,screenshot) if screenshot else answer_trader(messages,context,log_context)
                 with LOCK,connect() as db:
                     stamp=datetime.now(timezone.utc).isoformat()
                     for role,text in [('user',message),('assistant',answer)]:
-                        db.execute('INSERT INTO trader_messages(broker_id,role,content,created_at,context) VALUES(?,?,?,?,?)',(broker_id,role,text,stamp,json.dumps({'marketContext':context,'logContext':log_context}) if role=='assistant' and (context or log_context) else None))
-                self.reply(200,{'answer':answer,'context':context,'logContext':log_context})
+                        db.execute('INSERT INTO trader_messages(broker_id,role,content,created_at,context) VALUES(?,?,?,?,?)',(broker_id,role,text,user_stamp if role=='user' else stamp,json.dumps({'marketContext':context if role=='assistant' else None,'liveChartContext':chart_context if role=='assistant' else None,'logContext':log_context if role=='assistant' else None,'sources':sources})))
+                self.reply(200,{'answer':answer,'context':context,'chartContext':chart_context,'logContext':log_context,'sources':sources,'userCreatedAt':user_stamp,'assistantCreatedAt':stamp})
             elif self.path=='/api/ai/settings':
                 from ai_notes import configure_ai
                 length=int(self.headers.get('Content-Length','0'))

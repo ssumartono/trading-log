@@ -1,4 +1,18 @@
 /* Shared account context and non-blocking operation feedback. */
+function initializeNavigationCollapse(){
+  const shell=document.querySelector('.shell'),navigation=shell?.querySelector('aside');
+  if(!navigation||document.getElementById('navigation-toggle'))return;
+  navigation.id='app-navigation';
+  const toggle=document.createElement('button');toggle.id='navigation-toggle';toggle.type='button';toggle.className='navigation-toggle';toggle.setAttribute('aria-controls','app-navigation');
+  const icon=document.createElement('span'),label=document.createElement('span');icon.setAttribute('aria-hidden','true');label.className='navigation-toggle-label';toggle.append(icon,label);navigation.prepend(toggle);
+  navigation.querySelectorAll('.nav').forEach(button=>{const name=button.textContent.trim();button.setAttribute('aria-label',name);button.title=name});
+  let collapsed=false;try{collapsed=localStorage.getItem('tradinglog-navigation-collapsed')==='true'}catch{}
+  function apply(){shell.classList.toggle('navigation-collapsed',collapsed);toggle.setAttribute('aria-expanded',String(!collapsed));toggle.setAttribute('aria-label',collapsed?'Buka navigasi':'Ciutkan navigasi');toggle.title=collapsed?'Buka navigasi':'Ciutkan navigasi';icon.textContent=collapsed?'»':'«';label.textContent='Navigasi'}
+  toggle.onclick=()=>{collapsed=!collapsed;apply();try{localStorage.setItem('tradinglog-navigation-collapsed',String(collapsed))}catch{}};
+  apply();
+}
+if(typeof document.querySelector==='function')initializeNavigationCollapse();
+
 function accountIdentity(broker){
   if(!broker)return {name:'',login:'',label:''};
   const key=String(broker.accountKey||''),separator=key.lastIndexOf(':');

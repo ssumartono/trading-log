@@ -7,12 +7,12 @@ Aplikasi jurnal trading lokal dengan SQLite, integrasi MetaTrader 5, dan tampila
 - Dashboard sebagai Home, dengan ringkasan akun dan akses cepat.
 - Live Chart: candlestick, timeframe M1–D1, pembaruan setiap 5 detik, serta garis Entry/TP/SL. Default tanpa indikator dan tanpa grafik volume.
 - Indicators Library: Load beberapa Range Oscillator dengan periode/multiplier berbeda, hapus per panel atau sekaligus. Pilihan disimpan per pengguna dan akun di browser. Indikator lainnya berstatus MT5 saja.
-- Dashboard per akun, waterfall saldo, filter periode, dan riwayat transaksi.
+- Dashboard per akun dengan waterfall saldo, filter periode, serta tab Ringkasan dan Aktivitas terbaru untuk trading dan mutasi dana.
 - Kalender trading hingga jam, tabel log, sort dan pagination.
 - Pengaturan broker, tes koneksi, sinkronisasi MT5 dan riwayat Deposit/Withdraw.
 - Analisa Performance per log/deal: profit factor, rasio log profit, waterfall, heatmap dan perbandingan kelompok.
-- Catatan Harian, Memo, Event dan Lesson Learned dengan mailbox dan editor panel kanan.
-- AI Assistant untuk draf catatan dan AI Trader Assistant dengan konteks market opsional.
+- Catatan Harian, Memo, Event dan Lesson Learned dengan mailbox, detail/editor di area utama, serta AI Assistant di panel kanan.
+- AI Assistant menyalin draf langsung ke Catatan atau Memo; tanggal, jenis dan akun mengikuti catatan tanpa isian ganda. Opsi log mengikuti tanggal catatan tanpa panel filter/pratinjau tambahan. AI Trader Assistant mendukung konteks market opsional.
 - Integrasi AI baca-saja ke log SQLite: filter akun/periode/simbol/ticket, pratinjau dan sumber log.
 - Login, profil pengguna, Administrator, serta Manajemen Pengguna dan Peran & Hak Akses dalam tab.
 - Kepemilikan akun: pengguna hanya mengakses akun miliknya, termasuk Administrator; transfer akun melalui Manajemen Pengguna.
